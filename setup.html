@@ -1,0 +1,374 @@
+<!doctype html>
+<html lang="sv"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex"><title>Kilokampen – slå på sparningen</title>
+<style>
+  body{margin:0;font:17px/1.5 system-ui,sans-serif;background:#EEF3EF;color:#0F2A26}
+  main{max-width:640px;margin:0 auto;padding:24px 16px 48px}
+  h1{font-size:1.6rem;line-height:1.15;margin:0 0 8px}
+  ol{padding-left:22px} li{margin:14px 0}
+  .btn{display:block;width:100%;min-height:56px;border:0;border-radius:14px;background:#0B6B57;color:#fff;font:700 1.05rem system-ui;text-align:center;text-decoration:none;line-height:56px;cursor:pointer;margin-top:8px}
+  .btn.alt{background:#DCEFE7;color:#0F2A26}
+  textarea{width:100%;height:160px;margin-top:8px;border:1.5px solid #D5DFDA;border-radius:12px;padding:10px;font:12px/1.4 ui-monospace,monospace;box-sizing:border-box}
+  .ok{color:#0B7A52;font-weight:700;min-height:1.5em}
+  @media (prefers-color-scheme:dark){body{background:#0A1412;color:#E8F2EE}.btn{background:#3DD6A9;color:#062019}.btn.alt{background:#173029;color:#E8F2EE}textarea{background:#13211E;color:#E8F2EE;border-color:#243833}.ok{color:#5BE0A9}}
+</style></head><body><main>
+<h1>Slå på gemensam sparning</h1>
+<p>Görs en gång, tar ungefär två minuter. Fotbollsappens data rörs inte: Kilokampen får egna tabeller som alla börjar med <b>kk_</b>.</p>
+<ol>
+  <li>Kopiera texten.<button class="btn" id="copy">Kopiera texten</button><p class="ok" id="ok" aria-live="polite"></p></li>
+  <li>Öppna Supabase (samma projekt som fotbollsappen) och logga in om det behövs.
+    <a class="btn alt" href="https://supabase.com/dashboard/project/ifnjeskgfwylteajlzvp/sql/new" target="_blank" rel="noopener">Öppna SQL Editor</a></li>
+  <li>Klistra in texten i den stora rutan och tryck <b>Run</b>. Det ska stå "Success".</li>
+  <li>Öppna Kilokampen igen. Välj <b>Ny grupp</b>, och dela sedan länken under <b>Mer</b>.</li>
+</ol>
+<p>Fungerar inte kopieringen? Markera allt i rutan här och kopiera själv.</p>
+<textarea id="sql" readonly>-- Kilokampen database.
+-- Paste ALL of this into Supabase → SQL Editor and press Run. It is safe to run again.
+--
+-- How it is protected: the tables cannot be read or written from outside at all.
+-- The website only calls the kk_* functions below, and every one of them checks who is asking.
+-- People join a group with its invite code and pick a name and a PIN; nothing is public.
+
+create table if not exists kk_groups (
+  id uuid primary key default gen_random_uuid(),
+  code text not null unique,
+  name text not null,
+  start_date date not null default current_date,
+  end_date date,
+  owner_id uuid,
+  created_at timestamptz not null default now()
+);
+create table if not exists kk_members (
+  id uuid primary key default gen_random_uuid(),
+  group_id uuid not null references kk_groups(id) on delete cascade,
+  name text not null,
+  emoji text not null,
+  color text not null,
+  start_kg numeric(5,1) not null,
+  goal_kg numeric(5,1) not null,
+  joined date not null default current_date,
+  pin_salt text not null,
+  pin_hash text not null,
+  fails int not null default 0,
+  locked_until timestamptz,
+  created_at timestamptz not null default now()
+);
+create unique index if not exists kk_members_name on kk_members (group_id, lower(name));
+create table if not exists kk_sessions (
+  token uuid primary key default gen_random_uuid(),
+  member_id uuid not null references kk_members(id) on delete cascade,
+  created_at timestamptz not null default now()
+);
+create table if not exists kk_weigh_ins (
+  id uuid primary key default gen_random_uuid(),
+  member_id uuid not null references kk_members(id) on delete cascade,
+  date date not null,
+  kg numeric(5,1) not null,
+  unique (member_id, date)
+);
+create table if not exists kk_checks (
+  member_id uuid not null references kk_members(id) on delete cascade,
+  challenge_id text not null,
+  date date not null,
+  primary key (member_id, challenge_id, date)
+);
+create table if not exists kk_cheers (
+  id uuid primary key default gen_random_uuid(),
+  from_id uuid not null references kk_members(id) on delete cascade,
+  to_id uuid not null references kk_members(id) on delete cascade,
+  date date not null default current_date,
+  kind text not null
+);
+
+alter table kk_groups enable row level security;
+alter table kk_members enable row level security;
+alter table kk_sessions enable row level security;
+alter table kk_weigh_ins enable row level security;
+alter table kk_checks enable row level security;
+alter table kk_cheers enable row level security;
+revoke all on kk_groups, kk_members, kk_sessions, kk_weigh_ins, kk_checks, kk_cheers from anon, authenticated;
+
+-- ---------- helpers (not callable from outside) ----------
+
+create or replace function kk_hash(p_salt text, p_pin text) returns text
+language sql immutable as $$ select encode(sha256(convert_to(p_salt || ':' || p_pin, 'UTF8')), 'hex') $$;
+
+create or replace function kk_new_code() returns text
+language plpgsql security definer set search_path = public as $$
+declare
+  alphabet constant text := 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  bytes bytea;
+  result text;
+begin
+  loop
+    bytes := sha256(convert_to(gen_random_uuid()::text || gen_random_uuid()::text, 'UTF8'));
+    result := '';
+    for i in 0..7 loop
+      result := result || substr(alphabet, (get_byte(bytes, i) % 32) + 1, 1);
+    end loop;
+    exit when not exists (select 1 from kk_groups where code = result);
+  end loop;
+  return result;
+end $$;
+
+create or replace function kk_me(p_token uuid) returns kk_members
+language plpgsql security definer set search_path = public as $$
+declare me kk_members;
+begin
+  select m.* into me from kk_sessions s join kk_members m on m.id = s.member_id where s.token = p_token;
+  if me.id is null then raise exception 'not_signed_in'; end if;
+  return me;
+end $$;
+
+create or replace function kk_check_person(p_name text, p_pin text, p_start numeric, p_goal numeric) returns void
+language plpgsql immutable as $$
+begin
+  if p_name is null or length(btrim(p_name)) &lt; 1 or length(btrim(p_name)) &gt; 24 then raise exception 'bad_name'; end if;
+  if p_pin is null or p_pin !~ '^[0-9]{4,8}$' then raise exception 'bad_pin'; end if;
+  if p_start is null or p_start &lt; 40 or p_start &gt; 300 then raise exception 'bad_weight'; end if;
+  if p_goal is null or p_goal &gt;= p_start or p_goal &lt; p_start * 0.75 then raise exception 'bad_goal'; end if;
+end $$;
+
+create or replace function kk_challenges() returns text[]
+language sql immutable as $$ select array['steps','soda','stairs','water','greens','evening','walk','sweets','sleep','protein','fruit','fastfood',
+  'cook','workout','alcohol','slow','lunchbox','stretch','commute','portion'] $$;
+
+create or replace function kk_add_member(p_group uuid, p_name text, p_emoji text, p_pin text, p_start numeric, p_goal numeric,
+                                         p_weighins jsonb, p_checks jsonb) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  colors constant text[] := array['#0B6B57','#E5486D','#3B6FE0','#FF8A1F','#8A4FD3','#12A4B8','#C9A100','#D2452B'];
+  n int;
+  salt text := gen_random_uuid()::text;
+  new_id uuid;
+  first_day date;
+begin
+  perform kk_check_person(p_name, p_pin, p_start, p_goal);
+  if exists (select 1 from kk_members where group_id = p_group and lower(name) = lower(btrim(p_name))) then
+    raise exception 'name_taken';
+  end if;
+  select count(*) into n from kk_members where group_id = p_group;
+  if n &gt;= 60 then raise exception 'group_full'; end if;
+  insert into kk_members (group_id, name, emoji, color, start_kg, goal_kg, pin_salt, pin_hash)
+  values (p_group, btrim(p_name), left(coalesce(p_emoji, '💪'), 8), colors[(n % 8) + 1], round(p_start, 1), round(p_goal, 1), salt, kk_hash(salt, p_pin))
+  returning id into new_id;
+
+  insert into kk_weigh_ins (member_id, date, kg)
+  select new_id, (x-&gt;&gt;'date')::date, round((x-&gt;&gt;'kg')::numeric, 1)
+  from jsonb_array_elements(coalesce(p_weighins, '[]'::jsonb)) with ordinality as t(x, i)
+  where i &lt;= 400 and (x-&gt;&gt;'date')::date &lt;= current_date + 1 and (x-&gt;&gt;'kg')::numeric between 40 and 300
+  on conflict (member_id, date) do nothing;
+  if not exists (select 1 from kk_weigh_ins where member_id = new_id) then
+    insert into kk_weigh_ins (member_id, date, kg) values (new_id, current_date, round(p_start, 1));
+  end if;
+  select min(date) into first_day from kk_weigh_ins where member_id = new_id;
+  update kk_members set joined = first_day where id = new_id;
+
+  insert into kk_checks (member_id, challenge_id, date)
+  select new_id, x-&gt;&gt;'challengeId', (x-&gt;&gt;'date')::date
+  from jsonb_array_elements(coalesce(p_checks, '[]'::jsonb)) with ordinality as t(x, i)
+  where i &lt;= 400 and (x-&gt;&gt;'date')::date &lt;= current_date + 1 and x-&gt;&gt;'challengeId' = any (kk_challenges())
+  on conflict do nothing;
+  return new_id;
+end $$;
+
+create or replace function kk_open_session(p_member uuid) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare t uuid;
+begin
+  -- keep at most 10 devices signed in per person
+  delete from kk_sessions where member_id = p_member and token not in
+    (select token from kk_sessions where member_id = p_member order by created_at desc limit 9);
+  insert into kk_sessions (member_id) values (p_member) returning token into t;
+  return t;
+end $$;
+
+-- ---------- functions the website calls ----------
+
+create or replace function kk_state(p_token uuid) returns json
+language plpgsql security definer set search_path = public as $$
+declare me kk_members; g kk_groups;
+begin
+  me := kk_me(p_token);
+  select * into g from kk_groups where id = me.group_id;
+  return json_build_object(
+    'v', 1,
+    'meId', me.id,
+    'members', (select coalesce(json_agg(json_build_object(
+        'id', m.id, 'name', m.name, 'emoji', m.emoji, 'color', m.color,
+        'startKg', m.start_kg::float8, 'goalKg', m.goal_kg::float8, 'joined', m.joined) order by m.created_at), '[]'::json)
+      from kk_members m where m.group_id = g.id),
+    'weighIns', (select coalesce(json_agg(json_build_object(
+        'id', w.id, 'memberId', w.member_id, 'date', w.date, 'kg', w.kg::float8) order by w.date), '[]'::json)
+      from kk_weigh_ins w join kk_members m on m.id = w.member_id where m.group_id = g.id),
+    'checks', (select coalesce(json_agg(json_build_object(
+        'memberId', c.member_id, 'challengeId', c.challenge_id, 'date', c.date)), '[]'::json)
+      from kk_checks c join kk_members m on m.id = c.member_id where m.group_id = g.id),
+    'cheers', (select coalesce(json_agg(json_build_object(
+        'id', c.id, 'from', c.from_id, 'to', c.to_id, 'date', c.date, 'kind', c.kind) order by c.date), '[]'::json)
+      from kk_cheers c join kk_members m on m.id = c.to_id where m.group_id = g.id),
+    'settings', json_build_object('groupName', g.name, 'startDate', g.start_date, 'endDate', g.end_date,
+                                  'ownerId', g.owner_id, 'code', g.code)
+  );
+end $$;
+
+create or replace function kk_create_group(p_group_name text, p_name text, p_emoji text, p_pin text, p_start_kg numeric, p_goal_kg numeric,
+                                           p_weighins jsonb default '[]', p_checks jsonb default '[]') returns json
+language plpgsql security definer set search_path = public as $$
+declare gid uuid; mid uuid; gname text := left(btrim(coalesce(p_group_name, '')), 30);
+begin
+  if length(gname) &lt; 1 then gname := 'Kilokampen'; end if;
+  insert into kk_groups (code, name) values (kk_new_code(), gname) returning id into gid;
+  mid := kk_add_member(gid, p_name, p_emoji, p_pin, p_start_kg, p_goal_kg, p_weighins, p_checks);
+  update kk_groups set owner_id = mid where id = gid;
+  return json_build_object('token', kk_open_session(mid));
+end $$;
+
+create or replace function kk_join(p_code text, p_name text, p_emoji text, p_pin text, p_start_kg numeric, p_goal_kg numeric,
+                                   p_weighins jsonb default '[]', p_checks jsonb default '[]') returns json
+language plpgsql security definer set search_path = public as $$
+declare gid uuid; mid uuid;
+begin
+  select id into gid from kk_groups where code = upper(btrim(coalesce(p_code, '')));
+  if gid is null then raise exception 'bad_code'; end if;
+  mid := kk_add_member(gid, p_name, p_emoji, p_pin, p_start_kg, p_goal_kg, p_weighins, p_checks);
+  return json_build_object('token', kk_open_session(mid));
+end $$;
+
+-- Returns {"token": …} or {"error": "wrong_login" | "locked"}. Five wrong PINs lock the name for 15 minutes.
+create or replace function kk_login(p_code text, p_name text, p_pin text) returns json
+language plpgsql security definer set search_path = public as $$
+declare m kk_members;
+begin
+  select mm.* into m from kk_members mm join kk_groups g on g.id = mm.group_id
+  where g.code = upper(btrim(coalesce(p_code, ''))) and lower(mm.name) = lower(btrim(coalesce(p_name, '')));
+  if m.id is null then return json_build_object('error', 'wrong_login'); end if;
+  if m.locked_until is not null and m.locked_until &gt; now() then return json_build_object('error', 'locked'); end if;
+  if m.pin_hash &lt;&gt; kk_hash(m.pin_salt, coalesce(p_pin, '')) then
+    if m.fails + 1 &gt;= 5 then
+      update kk_members set fails = 0, locked_until = now() + interval '15 minutes' where id = m.id;
+      return json_build_object('error', 'locked');
+    end if;
+    update kk_members set fails = fails + 1 where id = m.id;
+    return json_build_object('error', 'wrong_login');
+  end if;
+  update kk_members set fails = 0, locked_until = null where id = m.id;
+  return json_build_object('token', kk_open_session(m.id));
+end $$;
+
+create or replace function kk_logout(p_token uuid) returns json
+language plpgsql security definer set search_path = public as $$
+begin
+  delete from kk_sessions where token = p_token;
+  return json_build_object('ok', true);
+end $$;
+
+create or replace function kk_weigh_in(p_token uuid, p_date date, p_kg numeric) returns json
+language plpgsql security definer set search_path = public as $$
+declare me kk_members;
+begin
+  me := kk_me(p_token);
+  if p_kg is null or p_kg &lt; 40 or p_kg &gt; 300 then raise exception 'bad_weight'; end if;
+  if p_date is null or p_date &gt; current_date + 1 or p_date &lt; current_date - 3650 then raise exception 'bad_date'; end if;
+  insert into kk_weigh_ins (member_id, date, kg) values (me.id, p_date, round(p_kg, 1))
+  on conflict (member_id, date) do update set kg = excluded.kg;
+  return kk_state(p_token);
+end $$;
+
+create or replace function kk_remove_weigh_in(p_token uuid, p_id uuid) returns json
+language plpgsql security definer set search_path = public as $$
+declare me kk_members;
+begin
+  me := kk_me(p_token);
+  if (select count(*) from kk_weigh_ins where member_id = me.id) &gt; 1 then
+    delete from kk_weigh_ins where id = p_id and member_id = me.id;
+  end if;
+  return kk_state(p_token);
+end $$;
+
+create or replace function kk_update_me(p_token uuid, p_goal_kg numeric) returns json
+language plpgsql security definer set search_path = public as $$
+declare me kk_members;
+begin
+  me := kk_me(p_token);
+  if p_goal_kg is null or p_goal_kg &gt;= me.start_kg or p_goal_kg &lt; me.start_kg * 0.75 then raise exception 'bad_goal'; end if;
+  update kk_members set goal_kg = round(p_goal_kg, 1) where id = me.id;
+  return kk_state(p_token);
+end $$;
+
+create or replace function kk_toggle_check(p_token uuid, p_challenge text, p_date date) returns json
+language plpgsql security definer set search_path = public as $$
+declare me kk_members;
+begin
+  me := kk_me(p_token);
+  if not (p_challenge = any (kk_challenges())) then raise exception 'bad_challenge'; end if;
+  if p_date is null or p_date &gt; current_date + 1 or p_date &lt; current_date - 14 then raise exception 'bad_date'; end if;
+  delete from kk_checks where member_id = me.id and challenge_id = p_challenge and date = p_date;
+  if not found then
+    insert into kk_checks (member_id, challenge_id, date) values (me.id, p_challenge, p_date);
+  end if;
+  return kk_state(p_token);
+end $$;
+
+create or replace function kk_cheer(p_token uuid, p_to uuid, p_kind text, p_date date) returns json
+language plpgsql security definer set search_path = public as $$
+declare me kk_members; d date := least(coalesce(p_date, current_date), current_date + 1);
+begin
+  me := kk_me(p_token);
+  if p_kind not in ('cheer', 'poke') then raise exception 'bad_kind'; end if;
+  if p_to = me.id or not exists (select 1 from kk_members where id = p_to and group_id = me.group_id) then
+    raise exception 'bad_member';
+  end if;
+  if not exists (select 1 from kk_cheers where from_id = me.id and to_id = p_to and kind = p_kind and date = d) then
+    insert into kk_cheers (from_id, to_id, kind, date) values (me.id, p_to, p_kind, d);
+  end if;
+  return kk_state(p_token);
+end $$;
+
+create or replace function kk_set_settings(p_token uuid, p_group_name text, p_end_date date) returns json
+language plpgsql security definer set search_path = public as $$
+declare me kk_members; gname text := left(btrim(coalesce(p_group_name, '')), 30);
+begin
+  me := kk_me(p_token);
+  if not exists (select 1 from kk_groups where id = me.group_id and owner_id = me.id) then raise exception 'not_owner'; end if;
+  update kk_groups set name = case when length(gname) &gt; 0 then gname else name end, end_date = p_end_date where id = me.group_id;
+  return kk_state(p_token);
+end $$;
+
+-- Removes the person and everything they entered. The group passes to the next member, or is removed when empty.
+create or replace function kk_leave(p_token uuid) returns json
+language plpgsql security definer set search_path = public as $$
+declare me kk_members; next_owner uuid;
+begin
+  me := kk_me(p_token);
+  delete from kk_members where id = me.id;
+  select id into next_owner from kk_members where group_id = me.group_id order by created_at limit 1;
+  if next_owner is null then
+    delete from kk_groups where id = me.group_id;
+  else
+    update kk_groups set owner_id = next_owner where id = me.group_id and owner_id = me.id;
+  end if;
+  return json_build_object('ok', true);
+end $$;
+
+-- ---------- who may call what ----------
+revoke all on function kk_hash(text, text), kk_new_code(), kk_me(uuid), kk_check_person(text, text, numeric, numeric), kk_challenges(),
+  kk_add_member(uuid, text, text, text, numeric, numeric, jsonb, jsonb), kk_open_session(uuid) from public, anon, authenticated;
+grant usage on schema public to anon, authenticated;
+grant execute on function
+  kk_state(uuid), kk_create_group(text, text, text, text, numeric, numeric, jsonb, jsonb),
+  kk_join(text, text, text, text, numeric, numeric, jsonb, jsonb), kk_login(text, text, text), kk_logout(uuid),
+  kk_weigh_in(uuid, date, numeric), kk_remove_weigh_in(uuid, uuid), kk_update_me(uuid, numeric),
+  kk_toggle_check(uuid, text, date), kk_cheer(uuid, uuid, text, date), kk_set_settings(uuid, text, date), kk_leave(uuid)
+  to anon, authenticated;
+
+notify pgrst, 'reload schema';
+</textarea>
+</main><script>
+  document.getElementById('copy').addEventListener('click', function () {
+    var t = document.getElementById('sql'), ok = document.getElementById('ok');
+    var done = function () { ok.textContent = 'Kopierat. Gå vidare till steg 2.'; };
+    if (navigator.clipboard) navigator.clipboard.writeText(t.value).then(done, function () { t.select(); document.execCommand('copy'); done(); });
+    else { t.select(); document.execCommand('copy'); done(); }
+  });
+</script></body></html>
