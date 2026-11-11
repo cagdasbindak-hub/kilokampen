@@ -88,6 +88,9 @@ create table if not exists kk_steps (
   steps int not null,
   primary key (member_id, date)
 );
+-- What has already been announced to the group, so that a milestone is only celebrated once.
+alter table kk_members add column if not exists kg_milestone int not null default 0;
+alter table kk_members add column if not exists goal_told boolean not null default false;
 alter table kk_steps enable row level security;
 revoke all on kk_steps from anon, authenticated;
 
@@ -173,7 +176,11 @@ begin
     insert into kk_weigh_ins (member_id, date, kg) values (new_id, current_date, round(p_start, 1));
   end if;
   select min(date) into first_day from kk_weigh_ins where member_id = new_id;
-  update kk_members set joined = first_day where id = new_id;
+  -- Start from what the person had already reached before joining: no notifications for old progress.
+  update kk_members m set joined = first_day,
+    kg_milestone = greatest(0, floor((m.start_kg - w.kg) / 2))::int, goal_told = w.kg &lt;= m.goal_kg
+  from (select kg from kk_weigh_ins where member_id = new_id order by date desc limit 1) w
+  where m.id = new_id;
 
   insert into kk_checks (member_id, challenge_id, date)
   select new_id, x-&gt;&gt;'challengeId', (x-&gt;&gt;'date')::date
@@ -292,6 +299,7 @@ begin
   if p_date is null or p_date &gt; current_date + 1 or p_date &lt; current_date - 3650 then raise exception 'bad_date'; end if;
   insert into kk_weigh_ins (member_id, date, kg) values (me.id, p_date, round(p_kg, 1))
   on conflict (member_id, date) do update set kg = excluded.kg;
+  perform kk_celebrate(me.id);
   return kk_state(p_token);
 end $$;
 
@@ -358,11 +366,17 @@ end $$;
 -- Steps for one day. 0 removes the day.
 create or replace function kk_set_steps(p_token uuid, p_date date, p_steps int) returns json
 language plpgsql security definer set search_path = public as $$
-declare me kk_members;
+declare me kk_members; before int;
 begin
   me := kk_me(p_token);
   if p_steps is null or p_steps &lt; 0 or p_steps &gt; 100000 then raise exception 'bad_steps'; end if;
   if p_date is null or p_date &gt; current_date + 1 or p_date &lt; current_date - 14 then raise exception 'bad_date'; end if;
+  select steps into before from kk_steps where member_id = me.id and date = p_date;
+  -- The first time the day's goal is reached, the group is told.
+  if p_steps &gt;= me.step_goal and coalesce(before, 0) &lt; me.step_goal and p_date &gt;= current_date - 1 then
+    perform kk_push(kk_others(me.id), me.name || ' nådde sitt stegmål 👟',
+      replace(to_char(p_steps, 'FM999,999'), ',', ' ') || ' steg i dag. Heja!', 'utmaningar', 'steps-' || me.id);
+  end if;
   if p_steps = 0 then
     delete from kk_steps where member_id = me.id and date = p_date;
   else
@@ -708,6 +722,51 @@ end $$;
 drop trigger if exists kk_cheer_push on kk_cheers;
 create trigger kk_cheer_push after insert on kk_cheers for each row execute function kk_on_cheer();
 
+-- Everyone in the person's group except the person.
+create or replace function kk_others(p_member uuid) returns uuid[]
+language sql security definer set search_path = public as $$
+  select array_agg(o.id) from kk_members m join kk_members o on o.group_id = m.group_id and o.id &lt;&gt; m.id where m.id = p_member
+$$;
+
+-- After a weigh-in: tell the group about every new 2 kg down, and when the goal weight is reached. Each only once.
+create or replace function kk_celebrate(p_member uuid) returns void
+language plpgsql security definer set search_path = public as $$
+declare m kk_members; latest numeric; steps int;
+begin
+  select * into m from kk_members where id = p_member;
+  select kg into latest from kk_weigh_ins where member_id = p_member order by date desc limit 1;
+  if latest is null then return; end if;
+  steps := greatest(0, floor((m.start_kg - latest) / 2))::int;
+  if latest &lt;= m.goal_kg and not m.goal_told then
+    update kk_members set goal_told = true, kg_milestone = greatest(kg_milestone, steps) where id = p_member;
+    perform kk_push(kk_others(p_member), m.name || ' är i mål! 🏆', 'Målvikten är nådd. Skicka ett hejarop!', 'topplista', 'goal-' || p_member);
+  elsif steps &gt; m.kg_milestone then
+    update kk_members set kg_milestone = steps where id = p_member;
+    perform kk_push(kk_others(p_member), m.name || ' har gått ner ' || (steps * 2) || ' kg! 🎉', 'Skicka ett hejarop!', 'topplista', 'kg-' || p_member);
+  end if;
+exception when others then
+  null;
+end $$;
+
+-- A new person in the group is announced to the others.
+create or replace function kk_on_member() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  perform kk_push(kk_others(new.id), new.name || ' har gått med 👋', 'Välkomna med ett hejarop!', 'topplista', 'join-' || new.id);
+  return new;
+exception when others then
+  return new;
+end $$;
+drop trigger if exists kk_member_push on kk_members;
+create trigger kk_member_push after insert on kk_members for each row execute function kk_on_member();
+
+-- People who were already in before milestones existed start from where they are now (never lowers anything).
+update kk_members m set
+  kg_milestone = greatest(m.kg_milestone, floor(greatest(0, m.start_kg - w.kg) / 2)::int),
+  goal_told = m.goal_told or w.kg &lt;= m.goal_kg
+from (select distinct on (member_id) member_id, kg from kk_weigh_ins order by member_id, date desc) w
+where w.member_id = m.id;
+
 -- Sunday reminder to everyone who has not weighed in this week (run by pg_cron, see the end of this file).
 create or replace function kk_weekly_reminder() returns void
 language plpgsql security definer set search_path = public as $$
@@ -718,8 +777,8 @@ begin
   perform kk_push(who, 'Veckans vikt saknas', 'Ställ dig på vågen och fyll i. Det tar tio sekunder.', 'hem', 'weigh');
 end $$;
 
-revoke all on function kk_push(uuid[], text, text, text, text), kk_on_feedback_reply(), kk_on_feedback(), kk_on_cheer(), kk_weekly_reminder()
-  from public, anon, authenticated;
+revoke all on function kk_push(uuid[], text, text, text, text), kk_on_feedback_reply(), kk_on_feedback(), kk_on_cheer(), kk_weekly_reminder(),
+  kk_others(uuid), kk_celebrate(uuid), kk_on_member() from public, anon, authenticated;
 grant execute on function kk_push_subscribe(uuid, text, text, text), kk_push_unsubscribe(uuid, text), kk_push_test(uuid) to anon, authenticated;
 
 -- ---------- who may call what ----------
