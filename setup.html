@@ -131,6 +131,10 @@ create table if not exists kk_fast_sent (
   kind text not null,
   primary key (member_id, day, kind)
 );
+-- Each coach question carries a one-time code, so it can be answered straight from the notification.
+alter table kk_fast_sent add column if not exists code uuid not null default gen_random_uuid();
+-- The language the person uses the app in (sv, en, tr); notifications are written in it (owner 2026-11-12).
+alter table kk_members add column if not exists lang text not null default 'sv';
 alter table kk_fast_days enable row level security;
 alter table kk_fast_sent enable row level security;
 revoke all on kk_fast_days, kk_fast_sent from anon, authenticated;
@@ -257,7 +261,7 @@ begin
     'members', (select coalesce(json_agg(json_build_object(
         'id', m.id, 'name', m.name, 'emoji', m.emoji, 'color', m.color,
         'startKg', m.start_kg::float8, 'goalKg', m.goal_kg::float8, 'joined', m.joined, 'stepGoal', m.step_goal,
-        'fastOn', m.fast_on, 'fastGoal', m.fast_goal,
+        'fastOn', m.fast_on, 'fastGoal', m.fast_goal, 'lang', m.lang,
         'fastYes', (select count(*) from kk_fast_days d where d.member_id = m.id and d.result = 'yes')) order by m.created_at), '[]'::json)
       from kk_members m where m.group_id = g.id),
     'weighIns', (select coalesce(json_agg(json_build_object(
@@ -426,8 +430,10 @@ begin
   select steps into before from kk_steps where member_id = me.id and date = p_date;
   -- The first time the day's goal is reached, the group is told.
   if p_steps &gt;= me.step_goal and coalesce(before, 0) &lt; me.step_goal and p_date &gt;= current_date - 1 then
-    perform kk_push(kk_others(me.id), me.name || ' nådde sitt stegmål 👟',
-      replace(to_char(p_steps, 'FM999,999'), ',', ' ') || ' steg i dag. Heja!', 'utmaningar', 'steps-' || me.id);
+    perform kk_push_i18n(kk_others(me.id), kk_msg(
+      me.name || ' nådde sitt stegmål 👟', kk_int(p_steps, 'sv') || ' steg i dag. Heja!',
+      me.name || ' reached their step goal 👟', kk_int(p_steps, 'en') || ' steps today. Go!',
+      me.name || ' adım hedefine ulaştı 👟', 'Bugün ' || kk_int(p_steps, 'tr') || ' adım. Helal olsun!'), 'utmaningar', 'steps-' || me.id);
   end if;
   if p_steps = 0 then
     delete from kk_steps where member_id = me.id and date = p_date;
@@ -695,21 +701,44 @@ create table if not exists kk_push_queue (
   created_at timestamptz not null default now(),
   sent_at timestamptz
 );
+-- Buttons on the notification (per language) and the one-time code their answer is sent with.
+alter table kk_push_queue add column if not exists actions jsonb;
+alter table kk_push_queue add column if not exists answer text;
 alter table kk_push_subs enable row level security;
 alter table kk_push_queue enable row level security;
 revoke all on kk_push_subs, kk_push_queue from anon, authenticated;
 grant select, insert, update, delete on kk_push_subs, kk_push_queue to service_role;
 
--- Queue one message for each listed person who has notifications on, then ask the sender to deliver.
--- Never lets a notification problem stop the thing that caused it.
-create or replace function kk_push(p_members uuid[], p_title text, p_body text, p_url text, p_tag text) returns void
+-- One message in Swedish, English and Turkish: {"sv": [title, body], "en": [...], "tr": [...]}.
+create or replace function kk_msg(p_sv_title text, p_sv_body text, p_en_title text, p_en_body text, p_tr_title text, p_tr_body text) returns jsonb
+language sql immutable as $$ select jsonb_build_object('sv', jsonb_build_array(p_sv_title, p_sv_body),
+  'en', jsonb_build_array(p_en_title, p_en_body), 'tr', jsonb_build_array(p_tr_title, p_tr_body)) $$;
+-- Numbers the way each language writes them: 1,3 / 1.3 and 9 200 / 9,200 / 9.200.
+create or replace function kk_dec(p numeric, p_lang text) returns text
+language sql immutable as $$ select case when p_lang = 'en' then to_char(p, 'FM9990.0') else replace(to_char(p, 'FM9990.0'), '.', ',') end $$;
+create or replace function kk_int(p int, p_lang text) returns text
+language sql immutable as $$ select case p_lang when 'en' then to_char(p, 'FM999,999') when 'tr' then replace(to_char(p, 'FM999,999'), ',', '.')
+  else replace(to_char(p, 'FM999,999'), ',', ' ') end $$;
+-- The coach's answer buttons, per language.
+create or replace function kk_yes_no() returns jsonb
+language sql immutable as $$ select jsonb_build_object(
+  'sv', jsonb_build_array(jsonb_build_object('action', 'yes', 'title', '✓ Ja'), jsonb_build_object('action', 'no', 'title', '✗ Nej')),
+  'en', jsonb_build_array(jsonb_build_object('action', 'yes', 'title', '✓ Yes'), jsonb_build_object('action', 'no', 'title', '✗ No')),
+  'tr', jsonb_build_array(jsonb_build_object('action', 'yes', 'title', '✓ Evet'), jsonb_build_object('action', 'no', 'title', '✗ Hayır'))) $$;
+
+-- Queue one message for each listed person who has notifications on, in that person's language (Swedish when the
+-- message has no text in it), then ask the sender to deliver. p_extra may carry buttons ({"actions": {lang: [...]}})
+-- and a one-time answer code ({"answer": "..."}). Never lets a notification problem stop the thing that caused it.
+create or replace function kk_push_i18n(p_members uuid[], p_msg jsonb, p_url text, p_tag text, p_extra jsonb default null) returns void
 language plpgsql security definer set search_path = public as $$
 declare n int;
 begin
-  insert into kk_push_queue (member_id, title, body, url, tag)
-  select distinct m, left(p_title, 80), left(p_body, 180), coalesce(p_url, ''), coalesce(p_tag, 'kilokampen')
-  from unnest(p_members) as m
-  where m is not null and exists (select 1 from kk_push_subs s where s.member_id = m);
+  insert into kk_push_queue (member_id, title, body, url, tag, actions, answer)
+  select m.id, left(coalesce(p_msg -&gt; m.lang -&gt;&gt; 0, p_msg -&gt; 'sv' -&gt;&gt; 0), 80), left(coalesce(p_msg -&gt; m.lang -&gt;&gt; 1, p_msg -&gt; 'sv' -&gt;&gt; 1), 180),
+    coalesce(p_url, ''), coalesce(p_tag, 'kilokampen'),
+    coalesce(p_extra -&gt; 'actions' -&gt; m.lang, p_extra -&gt; 'actions' -&gt; 'sv'), p_extra -&gt;&gt; 'answer'
+  from kk_members m
+  where m.id = any(p_members) and exists (select 1 from kk_push_subs s where s.member_id = m.id);
   get diagnostics n = row_count;
   if n &gt; 0 then
     perform net.http_post(
@@ -720,6 +749,11 @@ begin
 exception when others then
   null;
 end $$;
+-- The same message to everyone, in Swedish only (kept for old callers; new code uses kk_push_i18n).
+create or replace function kk_push(p_members uuid[], p_title text, p_body text, p_url text, p_tag text) returns void
+language sql security definer set search_path = public as $$
+  select kk_push_i18n(p_members, jsonb_build_object('sv', jsonb_build_array(p_title, p_body)), p_url, p_tag)
+$$;
 
 create or replace function kk_push_subscribe(p_token uuid, p_endpoint text, p_p256dh text, p_auth text) returns json
 language plpgsql security definer set search_path = public as $$
@@ -756,7 +790,8 @@ begin
   if (select count(*) from kk_push_queue where member_id = me.id and created_at &gt; now() - interval '1 hour') &gt;= 10 then
     raise exception 'too_many';
   end if;
-  perform kk_push(array[me.id], 'Kilokampen', 'Notiserna fungerar. Bra jobbat, ' || me.name || '!', '', 'test');
+  perform kk_push_i18n(array[me.id], kk_msg('Kilokampen', 'Notiserna fungerar. Bra jobbat, ' || me.name || '!',
+    'Kilokampen', 'Notifications work. Well done, ' || me.name || '!', 'Kilokampen', 'Bildirimler çalışıyor. Aferin, ' || me.name || '!'), '', 'test');
   return json_build_object('ok', true);
 end $$;
 
@@ -768,9 +803,11 @@ begin
   select * into f from kk_feedback where id = new.feedback_id;
   if new.official then
     select array_agg(m.id) into who from kk_members m where m.group_id = f.group_id and m.id is distinct from new.member_id;
-    perform kk_push(who, 'Nytt svar från ' || new.author, left(new.body, 160), 'forslag', 'fb-' || f.id);
+    perform kk_push_i18n(who, kk_msg('Nytt svar från ' || new.author, left(new.body, 160), 'New answer from ' || new.author, left(new.body, 160),
+      'Yeni cevap: ' || new.author, left(new.body, 160)), 'forslag', 'fb-' || f.id);
   elsif f.member_id is not null and f.member_id is distinct from new.member_id then
-    perform kk_push(array[f.member_id], new.author || ' svarade på ditt förslag', left(new.body, 160), 'forslag', 'fb-' || f.id);
+    perform kk_push_i18n(array[f.member_id], kk_msg(new.author || ' svarade på ditt förslag', left(new.body, 160),
+      new.author || ' answered your suggestion', left(new.body, 160), new.author || ' önerine cevap verdi', left(new.body, 160)), 'forslag', 'fb-' || f.id);
   end if;
   return new;
 exception when others then
@@ -786,7 +823,8 @@ declare owner uuid;
 begin
   select owner_id into owner from kk_groups where id = new.group_id;
   if owner is not null and owner is distinct from new.member_id then
-    perform kk_push(array[owner], 'Nytt förslag från ' || new.author, left(new.body, 160), 'forslag', 'fb-' || new.id);
+    perform kk_push_i18n(array[owner], kk_msg('Nytt förslag från ' || new.author, left(new.body, 160), 'New suggestion from ' || new.author, left(new.body, 160),
+      'Yeni öneri: ' || new.author, left(new.body, 160)), 'forslag', 'fb-' || new.id);
   end if;
   return new;
 exception when others then
@@ -802,9 +840,11 @@ declare sender text;
 begin
   select name into sender from kk_members where id = new.from_id;
   if new.kind = 'poke' then
-    perform kk_push(array[new.to_id], sender || ' påminner dig', 'Dags att väga in den här veckan ⏰', 'hem', 'poke');
+    perform kk_push_i18n(array[new.to_id], kk_msg(sender || ' påminner dig', 'Dags att väga in den här veckan ⏰',
+      sender || ' is reminding you', 'Time to weigh in this week ⏰', sender || ' sana hatırlatıyor', 'Bu hafta tartılma zamanı ⏰'), 'hem', 'poke');
   else
-    perform kk_push(array[new.to_id], sender || ' hejar på dig! 📣', 'Kämpa på, du gör det bra.', 'hem', 'cheer');
+    perform kk_push_i18n(array[new.to_id], kk_msg(sender || ' hejar på dig! 📣', 'Kämpa på, du gör det bra.',
+      sender || ' is cheering for you! 📣', 'Keep going, you are doing well.', sender || ' seni alkışlıyor! 📣', 'Devam et, çok iyi gidiyorsun.'), 'hem', 'cheer');
   end if;
   return new;
 exception when others then
@@ -830,10 +870,14 @@ begin
   steps := greatest(0, floor((m.start_kg - latest) / 2))::int;
   if latest &lt;= m.goal_kg and not m.goal_told then
     update kk_members set goal_told = true, kg_milestone = greatest(kg_milestone, steps) where id = p_member;
-    perform kk_push(kk_others(p_member), m.name || ' är i mål! 🏆', 'Målvikten är nådd. Skicka ett hejarop!', 'topplista', 'goal-' || p_member);
+    perform kk_push_i18n(kk_others(p_member), kk_msg(m.name || ' är i mål! 🏆', 'Målvikten är nådd. Skicka ett hejarop!',
+      m.name || ' reached the goal! 🏆', 'Goal weight reached. Send a cheer!', m.name || ' hedefe ulaştı! 🏆', 'Hedef kiloya ulaşıldı. Bir alkış gönder!'),
+      'topplista', 'goal-' || p_member);
   elsif steps &gt; m.kg_milestone then
     update kk_members set kg_milestone = steps where id = p_member;
-    perform kk_push(kk_others(p_member), m.name || ' har gått ner ' || (steps * 2) || ' kg! 🎉', 'Skicka ett hejarop!', 'topplista', 'kg-' || p_member);
+    perform kk_push_i18n(kk_others(p_member), kk_msg(m.name || ' har gått ner ' || (steps * 2) || ' kg! 🎉', 'Skicka ett hejarop!',
+      m.name || ' has lost ' || (steps * 2) || ' kg! 🎉', 'Send a cheer!', m.name || ' ' || (steps * 2) || ' kg verdi! 🎉', 'Bir alkış gönder!'),
+      'topplista', 'kg-' || p_member);
   end if;
 exception when others then
   null;
@@ -843,7 +887,8 @@ end $$;
 create or replace function kk_on_member() returns trigger
 language plpgsql security definer set search_path = public as $$
 begin
-  perform kk_push(kk_others(new.id), new.name || ' har gått med 👋', 'Välkomna med ett hejarop!', 'topplista', 'join-' || new.id);
+  perform kk_push_i18n(kk_others(new.id), kk_msg(new.name || ' har gått med 👋', 'Välkomna med ett hejarop!',
+    new.name || ' has joined 👋', 'Welcome them with a cheer!', new.name || ' gruba katıldı 👋', 'Bir alkışla karşılayın!'), 'topplista', 'join-' || new.id);
   return new;
 exception when others then
   return new;
@@ -882,8 +927,10 @@ begin
     get diagnostics n = row_count;
     if n = 1 and w.id is not null then
       select array_agg(id) into everyone from kk_members where group_id = p_group;
-      perform kk_push(everyone, '👑 Veckans vinnare: ' || w.name,
-        'Ner ' || replace(to_char(w.pct, 'FM990.0'), '.', ',') || ' % förra veckan (' || replace(to_char(w.kg, 'FM990.0'), '.', ',') || ' kg). Grattis!',
+      perform kk_push_i18n(everyone, kk_msg(
+        '👑 Veckans vinnare: ' || w.name, 'Ner ' || kk_dec(w.pct, 'sv') || ' % förra veckan (' || kk_dec(w.kg, 'sv') || ' kg). Grattis!',
+        '👑 Winner of the week: ' || w.name, 'Down ' || kk_dec(w.pct, 'en') || '% last week (' || kk_dec(w.kg, 'en') || ' kg). Congratulations!',
+        '👑 Haftanın kazananı: ' || w.name, 'Geçen hafta %' || kk_dec(w.pct, 'tr') || ' verdi (' || kk_dec(w.kg, 'tr') || ' kg). Tebrikler!'),
         'hem', 'week-' || mon);
     end if;
   end if;
@@ -900,10 +947,14 @@ begin
       order by (m.start_kg - l.kg) / m.start_kg desc, m.start_kg - l.kg desc, m.created_at limit 1;
       select array_agg(id) into everyone from kk_members where group_id = p_group;
       if w.name is not null then
-        perform kk_push(everyone, '🏁 Kampen är slut! Vinnare: ' || w.name,
-          'Ner ' || replace(to_char(w.pct, 'FM990.0'), '.', ',') || ' % sedan start. Se slutresultatet i appen.', 'hem', 'final');
+        perform kk_push_i18n(everyone, kk_msg(
+          '🏁 Kampen är slut! Vinnare: ' || w.name, 'Ner ' || kk_dec(w.pct, 'sv') || ' % sedan start. Se slutresultatet i appen.',
+          '🏁 The challenge is over! Winner: ' || w.name, 'Down ' || kk_dec(w.pct, 'en') || '% since the start. See the final result in the app.',
+          '🏁 Yarışma bitti! Kazanan: ' || w.name, 'Başlangıçtan beri %' || kk_dec(w.pct, 'tr') || ' verdi. Final sonucunu uygulamada gör.'), 'hem', 'final');
       else
-        perform kk_push(everyone, '🏁 Kampen är slut!', 'Se slutresultatet i appen. Bra kämpat, alla!', 'hem', 'final');
+        perform kk_push_i18n(everyone, kk_msg('🏁 Kampen är slut!', 'Se slutresultatet i appen. Bra kämpat, alla!',
+          '🏁 The challenge is over!', 'See the final result in the app. Well fought, everyone!',
+          '🏁 Yarışma bitti!', 'Final sonucunu uygulamada gör. Hepinizin emeğine sağlık!'), 'hem', 'final');
       end if;
     end if;
   end if;
@@ -931,6 +982,16 @@ begin
   return (select count(*) from kk_push_queue where tag = 'update' and created_at &gt; now() - interval '5 seconds')::int;
 end $$;
 
+-- The same news in each person's language: select kk_announce(kk_msg('Nytt i Kilokampen', '…', 'New in Kilokampen', '…', 'Kilokampen’de yeni', '…')).
+create or replace function kk_announce(p_msg jsonb) returns int
+language plpgsql security definer set search_path = public as $$
+declare everyone uuid[];
+begin
+  select array_agg(id) into everyone from kk_members;
+  perform kk_push_i18n(everyone, p_msg, 'mer', 'update');
+  return (select count(*) from kk_push_queue where tag = 'update' and created_at &gt; now() - interval '5 seconds')::int;
+end $$;
+
 -- Sunday reminder to everyone who has not weighed in this week (run by pg_cron, see the end of this file).
 create or replace function kk_weekly_reminder() returns void
 language plpgsql security definer set search_path = public as $$
@@ -938,7 +999,9 @@ declare who uuid[]; monday date := date_trunc('week', (now() at time zone 'Europ
 begin
   select array_agg(m.id) into who from kk_members m
   where not exists (select 1 from kk_weigh_ins w where w.member_id = m.id and w.date &gt;= monday);
-  perform kk_push(who, 'Veckans vikt saknas', 'Ställ dig på vågen och fyll i. Det tar tio sekunder.', 'hem', 'weigh');
+  perform kk_push_i18n(who, kk_msg('Veckans vikt saknas', 'Ställ dig på vågen och fyll i. Det tar tio sekunder.',
+    'This week’s weight is missing', 'Step on the scale and fill it in. It takes ten seconds.',
+    'Bu haftanın kilosu eksik', 'Tartıya çık ve gir. On saniye sürer.'), 'hem', 'weigh');
 end $$;
 
 -- ---------- the coach: Kvällsstopp (owner 2026-11-11) ----------
@@ -1029,8 +1092,8 @@ declare
   l date := kk_day(p_now);
   t timestamp := p_now at time zone 'Europe/Stockholm';
   mins int := extract(hour from t)::int * 60 + extract(minute from t)::int;
-  v int := extract(doy from l)::int;
-  m kk_members; open boolean; hard boolean; g text; n int;
+  i int := 1 + extract(doy from l)::int % 3;
+  m kk_members; open boolean; hard boolean; g text; c uuid;
 begin
   delete from kk_fast_sent where day &lt; l - 14;
   for m in select * from kk_members where fast_on loop
@@ -1038,48 +1101,132 @@ begin
     g := kk_hhmm(m.fast_goal);
     open := m.fast_since &lt;= l - 1
       and not exists (select 1 from kk_fast_days d where d.member_id = m.id and d.day = l - 1 and d.result is not null);
+    c := null;
     if open and mins between 480 and 719 then
-      insert into kk_fast_sent values (m.id, l, 'ask') on conflict do nothing;
-      get diagnostics n = row_count;
-      if n = 1 then
-        perform kk_push(array[m.id], case when hard then 'Coachen: rapportera' else 'God morgon' end,
-          case when hard then (array[
-            'Klarade du att inte äta efter ' || g || ' i går? Ja eller nej. Svara nu.',
-            'Rapport, tack. Höll du köket stängt efter ' || g || ' i går? Inga ursäkter, bara ett svar.',
-            'Ny dag. Först: höll du ' || g || ' i går kväll? Öppna appen och svara.'])[1 + v % 3]
-          else 'Klarade du gårdagens kvällsstopp kl ' || g || '? Svara i appen.' end, 'coach', 'fast-ask');
+      insert into kk_fast_sent (member_id, day, kind) values (m.id, l, 'ask') on conflict do nothing returning code into c;
+      if c is not null then
+        perform kk_push_i18n(array[m.id], case when hard then kk_msg(
+            'Coachen: rapportera', (array[
+              'Klarade du att inte äta efter ' || g || ' i går? Ja eller nej. Svara nu.',
+              'Rapport, tack. Höll du köket stängt efter ' || g || ' i går? Inga ursäkter, bara ett svar.',
+              'Ny dag. Först: höll du ' || g || ' i går kväll? Svara här.'])[i],
+            'The coach: report', (array[
+              'Did you manage not to eat after ' || g || ' yesterday? Yes or no. Answer now.',
+              'Report, please. Did you keep the kitchen closed after ' || g || ' yesterday? No excuses, just an answer.',
+              'New day. First: did you keep ' || g || ' last night? Answer here.'])[i],
+            'Koç: rapor ver', (array[
+              'Dün saat ' || g || ' sınırını tuttun mu? Evet ya da hayır. Hemen cevap ver.',
+              'Rapor ver. Dün saat ' || g || ' sonrası mutfak kapalı kaldı mı? Bahane yok, sadece cevap.',
+              'Yeni gün. Önce: dün akşam saat ' || g || ' sınırını tuttun mu? Buradan cevap ver.'])[i])
+          else kk_msg('God morgon', 'Klarade du gårdagens kvällsstopp kl ' || g || '?',
+            'Good morning', 'Did you keep yesterday’s evening stop at ' || g || '?',
+            'Günaydın', 'Dün akşamki saat ' || g || ' sınırını tuttun mu?') end,
+          'coach', 'fast-ask', jsonb_build_object('actions', kk_yes_no(), 'answer', c));
       end if;
     elsif open and mins between 720 and 1260 then
-      insert into kk_fast_sent values (m.id, l, 'nag') on conflict do nothing;
-      get diagnostics n = row_count;
-      if n = 1 then
-        perform kk_push(array[m.id], case when hard then 'Du har inte svarat' else 'Glömde du?' end,
-          case when hard then (array[
-            'Tystnad är också ett svar, och det är fel svar. Klarade du ' || g || ' i går?',
-            'Vinnare rapporterar. De andra gömmer sig. Vilken är du? Svara nu.',
-            'Coachen väntar fortfarande. Ett tryck: ja eller nej. Nu.'])[1 + v % 3]
-          else 'Svara gärna om gårdagens kvällsstopp kl ' || g || '.' end, 'coach', 'fast-ask');
+      insert into kk_fast_sent (member_id, day, kind) values (m.id, l, 'nag') on conflict do nothing returning code into c;
+      if c is not null then
+        perform kk_push_i18n(array[m.id], case when hard then kk_msg(
+            'Du har inte svarat', (array[
+              'Tystnad är också ett svar, och det är fel svar. Klarade du ' || g || ' i går?',
+              'Vinnare rapporterar. De andra gömmer sig. Vilken är du? Svara nu.',
+              'Coachen väntar fortfarande. Ett tryck: ja eller nej. Nu.'])[i],
+            'You have not answered', (array[
+              'Silence is an answer too, and it is the wrong one. Did you keep ' || g || ' yesterday?',
+              'Winners report. The others hide. Which one are you? Answer now.',
+              'The coach is still waiting. One tap: yes or no. Now.'])[i],
+            'Cevap vermedin', (array[
+              'Sessizlik de bir cevaptır, hem de yanlış olanı. Dün saat ' || g || ' sınırını tuttun mu?',
+              'Kazananlar rapor verir. Diğerleri saklanır. Sen hangisisin? Hemen cevap ver.',
+              'Koç hâlâ bekliyor. Tek dokunuş: evet ya da hayır. Şimdi.'])[i])
+          else kk_msg('Glömde du?', 'Svara gärna om gårdagens kvällsstopp kl ' || g || '.',
+            'Forgot?', 'Please answer about yesterday’s evening stop at ' || g || '.',
+            'Unuttun mu?', 'Dün akşamki saat ' || g || ' sınırı için cevap ver lütfen.') end,
+          'coach', 'fast-ask', jsonb_build_object('actions', kk_yes_no(), 'answer', c));
       end if;
     end if;
     if mins &gt;= m.fast_goal - 30 and mins &lt; m.fast_goal then
-      insert into kk_fast_sent values (m.id, l, 'warn') on conflict do nothing;
-      get diagnostics n = row_count;
-      if n = 1 then
-        perform kk_push(array[m.id], case when hard then '30 minuter kvar' else 'Snart kvällsstopp' end,
-          case when hard then (array[
-            'Kl ' || g || ' stänger köket. Sedan inget förrän du vaknar. Inte en bit.',
-            'Om 30 minuter, kl ' || g || ', är det slut för i kväll. Ät klart nu eller låt bli.',
-            g || ' är gränsen. Efter det: vatten, te eller sömn. Inget annat.'])[1 + v % 3]
-          else 'Ditt kvällsstopp är kl ' || g || '. 30 minuter kvar.' end, 'coach', 'fast-warn');
+      insert into kk_fast_sent (member_id, day, kind) values (m.id, l, 'warn') on conflict do nothing returning code into c;
+      if c is not null then
+        perform kk_push_i18n(array[m.id], case when hard then kk_msg(
+            '30 minuter kvar', (array[
+              'Kl ' || g || ' stänger köket. Sedan inget förrän du vaknar. Inte en bit.',
+              'Om 30 minuter, kl ' || g || ', är det slut för i kväll. Ät klart nu eller låt bli.',
+              g || ' är gränsen. Efter det: vatten, te eller sömn. Inget annat.'])[i],
+            '30 minutes left', (array[
+              'At ' || g || ' the kitchen closes. Then nothing until you wake up. Not a bite.',
+              'In 30 minutes, at ' || g || ', it is over for tonight. Finish eating now or leave it.',
+              g || ' is the limit. After that: water, tea or sleep. Nothing else.'])[i],
+            '30 dakika kaldı', (array[
+              'Saat ' || g || ' itibarıyla mutfak kapanıyor. Sonra uyanana kadar hiçbir şey yok. Bir lokma bile.',
+              '30 dakika sonra, saat ' || g || ', bu akşam bitiyor. Ya şimdi bitir ya hiç.',
+              'Sınır saat ' || g || '. Sonrası: su, çay ya da uyku. Başka bir şey yok.'])[i])
+          else kk_msg('Snart kvällsstopp', 'Ditt kvällsstopp är kl ' || g || '. 30 minuter kvar.',
+            'Evening stop soon', 'Your evening stop is at ' || g || '. 30 minutes left.',
+            'Akşam sınırı yaklaşıyor', 'Akşam sınırın saat ' || g || '. 30 dakika kaldı.') end,
+          'coach', 'fast-warn');
       end if;
     end if;
   end loop;
 end $$;
 
-revoke all on function kk_day(timestamptz), kk_stop_at(date, int), kk_hhmm(int), kk_fast_answer_at(uuid, text, timestamptz),
-  kk_fast_ate_at(uuid, timestamptz), kk_fast_tick(timestamptz) from public, anon, authenticated;
-grant execute on function kk_fast_set(uuid, boolean, integer, text), kk_fast_answer(uuid, text), kk_fast_ate(uuid) to anon, authenticated;
+-- An answer from the notification's buttons (through the kk-push sender, with its one-time code). Only today's
+-- question counts, once. Returns the coach's reply in the person's language and tone, shown as a new notification.
+create or replace function kk_fast_answer_code(p_code uuid, p_result text, p_now timestamptz default now()) returns json
+language plpgsql security definer set search_path = public as $$
+declare me kk_members; sent kk_fast_sent; g text; hard boolean; already boolean := false; title text; body text;
+begin
+  select * into sent from kk_fast_sent where code = p_code and kind in ('ask', 'nag') and day = kk_day(p_now);
+  if sent.member_id is null then return json_build_object('error', 'bad_code'); end if;
+  begin
+    perform kk_fast_answer_at(sent.member_id, p_result, p_now);
+  exception when others then
+    already := true;
+  end;
+  select * into me from kk_members where id = sent.member_id;
+  g := kk_hhmm(me.fast_goal);
+  hard := me.fast_tone &lt;&gt; 'soft';
+  title := case me.lang when 'en' then 'The coach' when 'tr' then 'Koç' else 'Coachen' end;
+  body := case
+    when already then case me.lang
+      when 'en' then case when hard then 'You already answered. Focus on tonight: ' || g || '.' else 'You already answered. Tonight: ' || g || '.' end
+      when 'tr' then case when hard then 'Zaten cevap verdin. Bu akşama odaklan: ' || g || '.' else 'Zaten cevap verdin. Bu akşam: ' || g || '.' end
+      else case when hard then 'Du har redan svarat. Fokusera på i kväll: ' || g || '.' else 'Du har redan svarat. I kväll: ' || g || '.' end end
+    when p_result = 'no' then case me.lang
+      when 'en' then case when hard then 'Weak, but honest. Same time tonight: ' || g || '. Do it again, do it right.' else 'It happens. Same time tonight: ' || g || '. You can do it.' end
+      when 'tr' then case when hard then 'Zayıf ama dürüst. Bu akşam aynı saat: ' || g || '. Tekrar yap, doğru yap.' else 'Olur böyle şeyler. Bu akşam aynı saat: ' || g || '. Başarabilirsin.' end
+      else case when hard then 'Svagt, men ärligt. Samma tid i kväll: ' || g || '. Gör om, gör rätt.' else 'Det händer. Samma tid i kväll: ' || g || '. Du klarar det.' end end
+    when me.fast_goal = 1140 then case me.lang
+      when 'en' then case when hard then g || ' is the floor. Hold it, every evening.' else 'You have reached ' || g || '. Hold it!' end
+      when 'tr' then case when hard then g || ' taban. Her akşam koru.' else g || ' saatine ulaştın. Koru!' end
+      else case when hard then g || ' är golvet. Håll det, varje kväll.' else 'Du har nått ' || g || '. Håll det!' end end
+    else case me.lang
+      when 'en' then case when hard then 'Good. Tonight: ' || g || '. No rest.' else 'Well done! Tonight: ' || g || '.' end
+      when 'tr' then case when hard then 'Güzel. Bu akşam: ' || g || '. Dinlenmek yok.' else 'Harika iş! Bu akşam: ' || g || '.' end
+      else case when hard then 'Bra. I kväll: ' || g || '. Ingen vila.' else 'Snyggt jobbat! I kväll: ' || g || '.' end end
+  end;
+  return json_build_object('title', title, 'body', body);
+end $$;
 
+-- The language the app is used in, so notifications come in it.
+create or replace function kk_set_lang(p_token uuid, p_lang text) returns json
+language plpgsql security definer set search_path = public as $$
+declare me kk_members;
+begin
+  me := kk_me(p_token);
+  if p_lang is null or p_lang not in ('sv', 'en', 'tr') then raise exception 'bad_text'; end if;
+  update kk_members set lang = p_lang where id = me.id;
+  return kk_state(p_token);
+end $$;
+
+revoke all on function kk_day(timestamptz), kk_stop_at(date, int), kk_hhmm(int), kk_fast_answer_at(uuid, text, timestamptz),
+  kk_fast_ate_at(uuid, timestamptz), kk_fast_tick(timestamptz), kk_fast_answer_code(uuid, text, timestamptz) from public, anon, authenticated;
+grant execute on function kk_fast_answer_code(uuid, text, timestamptz) to service_role;
+grant execute on function kk_fast_set(uuid, boolean, integer, text), kk_fast_answer(uuid, text), kk_fast_ate(uuid), kk_set_lang(uuid, text)
+  to anon, authenticated;
+
+revoke all on function kk_push_i18n(uuid[], jsonb, text, text, jsonb), kk_msg(text, text, text, text, text, text), kk_dec(numeric, text),
+  kk_int(int, text), kk_yes_no(), kk_announce(jsonb) from public, anon, authenticated;
 revoke all on function kk_push(uuid[], text, text, text, text), kk_on_feedback_reply(), kk_on_feedback(), kk_on_cheer(), kk_weekly_reminder(),
   kk_others(uuid), kk_celebrate(uuid), kk_on_member(), kk_close_week(uuid), kk_close_all_weeks(), kk_announce(text, text)
   from public, anon, authenticated;
