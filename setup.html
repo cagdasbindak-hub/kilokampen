@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="sv"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="robots" content="noindex"><title>Kilokampen – slå på sparningen</title>
+<meta name="robots" content="noindex"><title>Kilokampen – uppdatera databasen</title>
 <style>
   body{margin:0;font:17px/1.5 system-ui,sans-serif;background:#EEF3EF;color:#0F2A26}
   main{max-width:640px;margin:0 auto;padding:24px 16px 48px}
@@ -12,14 +12,14 @@
   .ok{color:#0B7A52;font-weight:700;min-height:1.5em}
   @media (prefers-color-scheme:dark){body{background:#0A1412;color:#E8F2EE}.btn{background:#3DD6A9;color:#062019}.btn.alt{background:#173029;color:#E8F2EE}textarea{background:#13211E;color:#E8F2EE;border-color:#243833}.ok{color:#5BE0A9}}
 </style></head><body><main>
-<h1>Slå på gemensam sparning</h1>
-<p>Görs en gång, tar ungefär två minuter. Fotbollsappens data rörs inte: Kilokampen får egna tabeller som alla börjar med <b>kk_</b>.</p>
+<h1>Uppdatera Kilokampens databas</h1>
+<p>Tar ungefär två minuter. Görs när Claude ber om det. Fotbollsappens data rörs inte: Kilokampen får egna tabeller som alla börjar med <b>kk_</b>.</p>
 <ol>
   <li>Kopiera texten.<button class="btn" id="copy">Kopiera texten</button><p class="ok" id="ok" aria-live="polite"></p></li>
   <li>Öppna Supabase (samma projekt som fotbollsappen) och logga in om det behövs.
     <a class="btn alt" href="https://supabase.com/dashboard/project/ifnjeskgfwylteajlzvp/sql/new" target="_blank" rel="noopener">Öppna SQL Editor</a></li>
   <li>Klistra in texten i den stora rutan och tryck <b>Run</b>. Det ska stå "Success".</li>
-  <li>Öppna Kilokampen igen. Välj <b>Ny grupp</b>, och dela sedan länken under <b>Mer</b>.</li>
+  <li>Klart. Öppna Kilokampen igen. Texten går bra att köra flera gånger, inget som redan är sparat försvinner.</li>
 </ol>
 <p>Fungerar inte kopieringen? Markera allt i rutan här och kopiera själv.</p>
 <textarea id="sql" readonly>-- Kilokampen database.
@@ -208,7 +208,14 @@ begin
         'id', c.id, 'from', c.from_id, 'to', c.to_id, 'date', c.date, 'kind', c.kind) order by c.date), '[]'::json)
       from kk_cheers c join kk_members m on m.id = c.to_id where m.group_id = g.id),
     'settings', json_build_object('groupName', g.name, 'startDate', g.start_date, 'endDate', g.end_date,
-                                  'ownerId', g.owner_id, 'code', g.code)
+                                  'ownerId', g.owner_id, 'code', g.code),
+    -- badges: answers I have not read yet, and (for the owner) posts nobody has answered officially
+    'fb', json_build_object(
+      'news', (select count(*) from kk_feedback f where f.member_id = me.id and exists (
+                 select 1 from kk_feedback_replies r where r.feedback_id = f.id and r.official
+                   and r.created_at &gt; coalesce(f.seen_at, f.created_at))),
+      'open', case when g.owner_id = me.id then (select count(*) from kk_feedback f where f.group_id = g.id
+                 and not exists (select 1 from kk_feedback_replies r where r.feedback_id = f.id and r.official)) else 0 end)
   );
 end $$;
 
@@ -350,6 +357,176 @@ begin
   end if;
   return json_build_object('ok', true);
 end $$;
+
+-- ---------- feedback board ----------
+-- Members post suggestions and problems (with an optional screenshot). Everyone in the group reads them.
+-- The group owner, and the developer through the kk_admin_* functions, answer and set a status.
+
+create table if not exists kk_feedback (
+  id uuid primary key default gen_random_uuid(),
+  group_id uuid not null references kk_groups(id) on delete cascade,
+  member_id uuid references kk_members(id) on delete set null,
+  author text not null,
+  body text not null,
+  image text,
+  status text not null default 'new',
+  seen_at timestamptz,
+  created_at timestamptz not null default now()
+);
+create table if not exists kk_feedback_replies (
+  id uuid primary key default gen_random_uuid(),
+  feedback_id uuid not null references kk_feedback(id) on delete cascade,
+  member_id uuid references kk_members(id) on delete set null,
+  author text not null,
+  official boolean not null default false,
+  body text not null,
+  created_at timestamptz not null default now()
+);
+-- Holds only a fingerprint of the developer key; the key itself is never stored here.
+create table if not exists kk_admin (id int primary key default 1 check (id = 1), key_hash text not null);
+insert into kk_admin (id, key_hash) values (1, 'da25f2bc0cb3071df168e09d8a1daa47aa13bd6796219412a306afc6484c2f7d')
+on conflict (id) do update set key_hash = excluded.key_hash;
+
+alter table kk_feedback enable row level security;
+alter table kk_feedback_replies enable row level security;
+alter table kk_admin enable row level security;
+revoke all on kk_feedback, kk_feedback_replies, kk_admin from anon, authenticated;
+
+create or replace function kk_fb_status_ok(p_status text) returns boolean
+language sql immutable as $$ select p_status in ('new', 'planned', 'doing', 'done', 'declined') $$;
+
+create or replace function kk_fb_list(p_group uuid, p_me uuid) returns json
+language sql security definer set search_path = public as $$
+  select coalesce(json_agg(t.item order by t.created desc), '[]'::json) from (
+    select f.created_at as created, json_build_object(
+      'id', f.id, 'author', f.author, 'mine', p_me is not null and f.member_id = p_me, 'body', f.body,
+      'hasImage', f.image is not null, 'status', f.status, 'createdAt', f.created_at,
+      'group', (select g.name from kk_groups g where g.id = f.group_id),
+      'replies', (select coalesce(json_agg(json_build_object(
+          'id', r.id, 'author', r.author, 'official', r.official, 'body', r.body, 'createdAt', r.created_at) order by r.created_at), '[]'::json)
+        from kk_feedback_replies r where r.feedback_id = f.id)) as item
+    from kk_feedback f where p_group is null or f.group_id = p_group
+  ) t
+$$;
+
+create or replace function kk_admin_check(p_key text) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  if p_key is null or length(p_key) &lt; 32 or not exists (select 1 from kk_admin where key_hash = kk_hash('admin', p_key)) then
+    raise exception 'not_signed_in';
+  end if;
+end $$;
+
+-- p_seen = true also marks the answers to my own posts as read.
+create or replace function kk_feedback_list(p_token uuid, p_seen boolean default false) returns json
+language plpgsql security definer set search_path = public as $$
+declare me kk_members;
+begin
+  me := kk_me(p_token);
+  if p_seen then update kk_feedback set seen_at = now() where member_id = me.id; end if;
+  return kk_fb_list(me.group_id, me.id);
+end $$;
+
+create or replace function kk_feedback_add(p_token uuid, p_body text, p_image text default null) returns json
+language plpgsql security definer set search_path = public as $$
+declare me kk_members; txt text := btrim(coalesce(p_body, ''));
+begin
+  me := kk_me(p_token);
+  if length(txt) &lt; 3 or length(txt) &gt; 1500 then raise exception 'bad_text'; end if;
+  if p_image is not null and (p_image !~ '^data:image/(jpeg|png|webp);base64,' or length(p_image) &gt; 700000) then raise exception 'bad_image'; end if;
+  if (select count(*) from kk_feedback where member_id = me.id and created_at &gt; now() - interval '1 day') &gt;= 10
+     or (select count(*) from kk_feedback where group_id = me.group_id) &gt;= 500 then raise exception 'too_many'; end if;
+  insert into kk_feedback (group_id, member_id, author, body, image, seen_at) values (me.group_id, me.id, me.name, txt, p_image, now());
+  return kk_fb_list(me.group_id, me.id);
+end $$;
+
+create or replace function kk_feedback_image(p_token uuid, p_id uuid) returns json
+language plpgsql security definer set search_path = public as $$
+declare me kk_members;
+begin
+  me := kk_me(p_token);
+  return json_build_object('image', (select image from kk_feedback where id = p_id and group_id = me.group_id));
+end $$;
+
+-- Anyone in the group can write in a thread. The owner's answers are marked official, and only the owner sets the status.
+create or replace function kk_feedback_reply(p_token uuid, p_id uuid, p_body text, p_status text default null) returns json
+language plpgsql security definer set search_path = public as $$
+declare me kk_members; txt text := btrim(coalesce(p_body, '')); is_owner boolean;
+begin
+  me := kk_me(p_token);
+  if not exists (select 1 from kk_feedback where id = p_id and group_id = me.group_id) then raise exception 'bad_member'; end if;
+  select owner_id = me.id into is_owner from kk_groups where id = me.group_id;
+  if p_status is not null then
+    if not coalesce(is_owner, false) then raise exception 'not_owner'; end if;
+    if not kk_fb_status_ok(p_status) then raise exception 'bad_text'; end if;
+    update kk_feedback set status = p_status where id = p_id;
+  end if;
+  if length(txt) &gt; 0 then
+    if length(txt) &gt; 1500 then raise exception 'bad_text'; end if;
+    if (select count(*) from kk_feedback_replies where member_id = me.id and created_at &gt; now() - interval '1 day') &gt;= 40 then raise exception 'too_many'; end if;
+    insert into kk_feedback_replies (feedback_id, member_id, author, official, body) values (p_id, me.id, me.name, coalesce(is_owner, false), txt);
+  elsif p_status is null then
+    raise exception 'bad_text';
+  end if;
+  return kk_fb_list(me.group_id, me.id);
+end $$;
+
+create or replace function kk_feedback_remove(p_token uuid, p_id uuid) returns json
+language plpgsql security definer set search_path = public as $$
+declare me kk_members;
+begin
+  me := kk_me(p_token);
+  delete from kk_feedback f where f.id = p_id and f.group_id = me.group_id
+    and (f.member_id = me.id or exists (select 1 from kk_groups g where g.id = me.group_id and g.owner_id = me.id));
+  return kk_fb_list(me.group_id, me.id);
+end $$;
+
+-- Developer side (scripts/feedback.mjs): all groups, needs the developer key.
+create or replace function kk_admin_feedback(p_key text) returns json
+language plpgsql security definer set search_path = public as $$
+begin
+  perform kk_admin_check(p_key);
+  return kk_fb_list(null, null);
+end $$;
+
+create or replace function kk_admin_feedback_image(p_key text, p_id uuid) returns json
+language plpgsql security definer set search_path = public as $$
+begin
+  perform kk_admin_check(p_key);
+  return json_build_object('image', (select image from kk_feedback where id = p_id));
+end $$;
+
+create or replace function kk_admin_feedback_reply(p_key text, p_id uuid, p_body text, p_status text default null, p_author text default 'Cagdas bot') returns json
+language plpgsql security definer set search_path = public as $$
+declare txt text := btrim(coalesce(p_body, ''));
+begin
+  perform kk_admin_check(p_key);
+  if not exists (select 1 from kk_feedback where id = p_id) then raise exception 'bad_member'; end if;
+  if p_status is not null then
+    if not kk_fb_status_ok(p_status) then raise exception 'bad_text'; end if;
+    update kk_feedback set status = p_status where id = p_id;
+  end if;
+  if length(txt) &gt; 0 then
+    insert into kk_feedback_replies (feedback_id, author, official, body) values (p_id, left(btrim(p_author), 30), true, left(txt, 1500));
+  end if;
+  return kk_fb_list(null, null);
+end $$;
+
+create or replace function kk_admin_feedback_remove(p_key text, p_id uuid) returns json
+language plpgsql security definer set search_path = public as $$
+begin
+  perform kk_admin_check(p_key);
+  delete from kk_feedback where id = p_id;
+  return kk_fb_list(null, null);
+end $$;
+
+revoke all on function kk_fb_status_ok(text), kk_fb_list(uuid, uuid), kk_admin_check(text) from public, anon, authenticated;
+grant execute on function
+  kk_feedback_list(uuid, boolean), kk_feedback_add(uuid, text, text), kk_feedback_image(uuid, uuid),
+  kk_feedback_reply(uuid, uuid, text, text), kk_feedback_remove(uuid, uuid),
+  kk_admin_feedback(text), kk_admin_feedback_image(text, uuid), kk_admin_feedback_reply(text, uuid, text, text, text),
+  kk_admin_feedback_remove(text, uuid)
+  to anon, authenticated;
 
 -- ---------- who may call what ----------
 revoke all on function kk_hash(text, text), kk_new_code(), kk_me(uuid), kk_check_person(text, text, numeric, numeric), kk_challenges(),
