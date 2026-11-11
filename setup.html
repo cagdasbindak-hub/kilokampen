@@ -80,6 +80,17 @@ create table if not exists kk_cheers (
   kind text not null
 );
 
+-- Daily steps, typed in by each person (a website cannot read the phone's step counter), and a personal daily goal.
+alter table kk_members add column if not exists step_goal int not null default 8000;
+create table if not exists kk_steps (
+  member_id uuid not null references kk_members(id) on delete cascade,
+  date date not null,
+  steps int not null,
+  primary key (member_id, date)
+);
+alter table kk_steps enable row level security;
+revoke all on kk_steps from anon, authenticated;
+
 alter table kk_groups enable row level security;
 alter table kk_members enable row level security;
 alter table kk_sessions enable row level security;
@@ -196,7 +207,7 @@ begin
     'meId', me.id,
     'members', (select coalesce(json_agg(json_build_object(
         'id', m.id, 'name', m.name, 'emoji', m.emoji, 'color', m.color,
-        'startKg', m.start_kg::float8, 'goalKg', m.goal_kg::float8, 'joined', m.joined) order by m.created_at), '[]'::json)
+        'startKg', m.start_kg::float8, 'goalKg', m.goal_kg::float8, 'joined', m.joined, 'stepGoal', m.step_goal) order by m.created_at), '[]'::json)
       from kk_members m where m.group_id = g.id),
     'weighIns', (select coalesce(json_agg(json_build_object(
         'id', w.id, 'memberId', w.member_id, 'date', w.date, 'kg', w.kg::float8) order by w.date), '[]'::json)
@@ -207,6 +218,8 @@ begin
     'cheers', (select coalesce(json_agg(json_build_object(
         'id', c.id, 'from', c.from_id, 'to', c.to_id, 'date', c.date, 'kind', c.kind) order by c.date), '[]'::json)
       from kk_cheers c join kk_members m on m.id = c.to_id where m.group_id = g.id),
+    'steps', (select coalesce(json_agg(json_build_object('memberId', st.member_id, 'date', st.date, 'steps', st.steps)), '[]'::json)
+      from kk_steps st join kk_members m on m.id = st.member_id where m.group_id = g.id and st.date &gt;= current_date - 60),
     'settings', json_build_object('groupName', g.name, 'startDate', g.start_date, 'endDate', g.end_date,
                                   'ownerId', g.owner_id, 'code', g.code),
     -- badges: answers I have not read yet, and (for the owner) posts nobody has answered officially
@@ -339,6 +352,33 @@ begin
   me := kk_me(p_token);
   if not exists (select 1 from kk_groups where id = me.group_id and owner_id = me.id) then raise exception 'not_owner'; end if;
   update kk_groups set name = case when length(gname) &gt; 0 then gname else name end, end_date = p_end_date where id = me.group_id;
+  return kk_state(p_token);
+end $$;
+
+-- Steps for one day. 0 removes the day.
+create or replace function kk_set_steps(p_token uuid, p_date date, p_steps int) returns json
+language plpgsql security definer set search_path = public as $$
+declare me kk_members;
+begin
+  me := kk_me(p_token);
+  if p_steps is null or p_steps &lt; 0 or p_steps &gt; 100000 then raise exception 'bad_steps'; end if;
+  if p_date is null or p_date &gt; current_date + 1 or p_date &lt; current_date - 14 then raise exception 'bad_date'; end if;
+  if p_steps = 0 then
+    delete from kk_steps where member_id = me.id and date = p_date;
+  else
+    insert into kk_steps (member_id, date, steps) values (me.id, p_date, p_steps)
+    on conflict (member_id, date) do update set steps = excluded.steps;
+  end if;
+  return kk_state(p_token);
+end $$;
+
+create or replace function kk_set_step_goal(p_token uuid, p_goal int) returns json
+language plpgsql security definer set search_path = public as $$
+declare me kk_members;
+begin
+  me := kk_me(p_token);
+  if p_goal is null or p_goal &lt; 1000 or p_goal &gt; 40000 then raise exception 'bad_steps'; end if;
+  update kk_members set step_goal = p_goal where id = me.id;
   return kk_state(p_token);
 end $$;
 
@@ -536,7 +576,8 @@ grant execute on function
   kk_state(uuid), kk_create_group(text, text, text, text, numeric, numeric, jsonb, jsonb),
   kk_join(text, text, text, text, numeric, numeric, jsonb, jsonb), kk_login(text, text, text), kk_logout(uuid),
   kk_weigh_in(uuid, date, numeric), kk_remove_weigh_in(uuid, uuid), kk_update_me(uuid, numeric),
-  kk_toggle_check(uuid, text, date), kk_cheer(uuid, uuid, text, date), kk_set_settings(uuid, text, date), kk_leave(uuid)
+  kk_toggle_check(uuid, text, date), kk_cheer(uuid, uuid, text, date), kk_set_settings(uuid, text, date), kk_leave(uuid),
+  kk_set_steps(uuid, date, integer), kk_set_step_goal(uuid, integer)
   to anon, authenticated;
 
 notify pgrst, 'reload schema';
