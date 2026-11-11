@@ -415,6 +415,45 @@ begin
   return kk_state(p_token);
 end $$;
 
+-- Change your own PIN (you must know the old one). Other devices are signed out.
+create or replace function kk_change_pin(p_token uuid, p_old_pin text, p_new_pin text) returns json
+language plpgsql security definer set search_path = public as $$
+declare me kk_members; salt text := gen_random_uuid()::text;
+begin
+  me := kk_me(p_token);
+  if me.pin_hash &lt;&gt; kk_hash(me.pin_salt, coalesce(p_old_pin, '')) then return json_build_object('error', 'wrong_login'); end if;
+  if p_new_pin is null or p_new_pin !~ '^[0-9]{4,8}$' then raise exception 'bad_pin'; end if;
+  update kk_members set pin_salt = salt, pin_hash = kk_hash(salt, p_new_pin), fails = 0, locked_until = null where id = me.id;
+  delete from kk_sessions where member_id = me.id and token &lt;&gt; p_token;
+  return json_build_object('ok', true);
+end $$;
+
+-- The group owner gives a member who forgot their PIN a new one. That member is signed out everywhere.
+create or replace function kk_owner_reset_pin(p_token uuid, p_member uuid, p_new_pin text) returns json
+language plpgsql security definer set search_path = public as $$
+declare me kk_members; salt text := gen_random_uuid()::text;
+begin
+  me := kk_me(p_token);
+  if not exists (select 1 from kk_groups where id = me.group_id and owner_id = me.id) then raise exception 'not_owner'; end if;
+  if p_member = me.id or not exists (select 1 from kk_members where id = p_member and group_id = me.group_id) then raise exception 'bad_member'; end if;
+  if p_new_pin is null or p_new_pin !~ '^[0-9]{4,8}$' then raise exception 'bad_pin'; end if;
+  update kk_members set pin_salt = salt, pin_hash = kk_hash(salt, p_new_pin), fails = 0, locked_until = null where id = p_member;
+  delete from kk_sessions where member_id = p_member;
+  return json_build_object('ok', true);
+end $$;
+
+-- The group owner removes a member and everything that member entered. Cannot be undone.
+create or replace function kk_owner_remove(p_token uuid, p_member uuid) returns json
+language plpgsql security definer set search_path = public as $$
+declare me kk_members;
+begin
+  me := kk_me(p_token);
+  if not exists (select 1 from kk_groups where id = me.group_id and owner_id = me.id) then raise exception 'not_owner'; end if;
+  if p_member = me.id or not exists (select 1 from kk_members where id = p_member and group_id = me.group_id) then raise exception 'bad_member'; end if;
+  delete from kk_members where id = p_member;
+  return kk_state(p_token);
+end $$;
+
 -- Removes the person and everything they entered. The group passes to the next member, or is removed when empty.
 create or replace function kk_leave(p_token uuid) returns json
 language plpgsql security definer set search_path = public as $$
@@ -879,7 +918,8 @@ grant execute on function
   kk_join(text, text, text, text, numeric, numeric, jsonb, jsonb), kk_login(text, text, text), kk_logout(uuid),
   kk_weigh_in(uuid, date, numeric), kk_remove_weigh_in(uuid, uuid), kk_update_me(uuid, numeric),
   kk_toggle_check(uuid, text, date), kk_cheer(uuid, uuid, text, date), kk_set_settings(uuid, text, date), kk_leave(uuid),
-  kk_set_steps(uuid, date, integer), kk_set_step_goal(uuid, integer)
+  kk_set_steps(uuid, date, integer), kk_set_step_goal(uuid, integer),
+  kk_change_pin(uuid, text, text), kk_owner_reset_pin(uuid, uuid, text), kk_owner_remove(uuid, uuid)
   to anon, authenticated;
 
 -- Sundays 16:00 UTC (17:00 or 18:00 in Sweden): the weigh-in reminder. Skipped where pg_cron is not installed.
