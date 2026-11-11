@@ -16,3 +16,23 @@ self.addEventListener('fetch', (e) => {
       .catch(() => caches.match(req).then((hit) => hit || caches.match('./')))
   );
 });
+
+// Notifications. The payload is { title, body, url, tag }; url is a view name such as "forslag".
+self.addEventListener('push', (e) => {
+  let d = {};
+  try { d = e.data ? e.data.json() : {}; } catch { /* not JSON: show a plain notification */ }
+  e.waitUntil(self.registration.showNotification(d.title || 'Kilokampen', {
+    body: d.body || '', icon: 'icon-192.png', badge: 'icon-192.png', tag: d.tag || 'kilokampen', data: { url: d.url || '' },
+  }));
+});
+self.addEventListener('notificationclick', (e) => {
+  e.notification.close();
+  const view = (e.notification.data && e.notification.data.url) || '';
+  const target = self.registration.scope + (view ? '#' + view : '');
+  e.waitUntil(self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((list) => {
+    for (const c of list) {
+      if (c.url.startsWith(self.registration.scope)) { c.postMessage({ kkOpen: view }); return c.focus(); }
+    }
+    return self.clients.openWindow(target);
+  }));
+});

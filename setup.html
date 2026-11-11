@@ -568,6 +568,160 @@ grant execute on function
   kk_admin_feedback_remove(text, uuid)
   to anon, authenticated;
 
+-- ---------- notifications (web push) ----------
+-- Each phone that turns notifications on is saved in kk_push_subs. The triggers below put messages in
+-- kk_push_queue and then call the kk-push edge function, which sends whatever is waiting.
+
+create table if not exists kk_push_subs (
+  id uuid primary key default gen_random_uuid(),
+  member_id uuid not null references kk_members(id) on delete cascade,
+  endpoint text not null unique,
+  p256dh text not null,
+  auth text not null,
+  created_at timestamptz not null default now()
+);
+create table if not exists kk_push_queue (
+  id uuid primary key default gen_random_uuid(),
+  member_id uuid not null references kk_members(id) on delete cascade,
+  title text not null,
+  body text not null,
+  url text not null default '',
+  tag text not null default 'kilokampen',
+  created_at timestamptz not null default now(),
+  sent_at timestamptz
+);
+alter table kk_push_subs enable row level security;
+alter table kk_push_queue enable row level security;
+revoke all on kk_push_subs, kk_push_queue from anon, authenticated;
+grant select, insert, update, delete on kk_push_subs, kk_push_queue to service_role;
+
+-- Queue one message for each listed person who has notifications on, then ask the sender to deliver.
+-- Never lets a notification problem stop the thing that caused it.
+create or replace function kk_push(p_members uuid[], p_title text, p_body text, p_url text, p_tag text) returns void
+language plpgsql security definer set search_path = public as $$
+declare n int;
+begin
+  insert into kk_push_queue (member_id, title, body, url, tag)
+  select distinct m, left(p_title, 80), left(p_body, 180), coalesce(p_url, ''), coalesce(p_tag, 'kilokampen')
+  from unnest(p_members) as m
+  where m is not null and exists (select 1 from kk_push_subs s where s.member_id = m);
+  get diagnostics n = row_count;
+  if n &gt; 0 then
+    perform net.http_post(
+      url := 'https://ifnjeskgfwylteajlzvp.supabase.co/functions/v1/kk-push',
+      headers := jsonb_build_object('Content-Type', 'application/json'),
+      body := '{}'::jsonb);
+  end if;
+exception when others then
+  null;
+end $$;
+
+create or replace function kk_push_subscribe(p_token uuid, p_endpoint text, p_p256dh text, p_auth text) returns json
+language plpgsql security definer set search_path = public as $$
+declare me kk_members;
+begin
+  me := kk_me(p_token);
+  if p_endpoint is null or p_endpoint !~ '^https://' or length(p_endpoint) &gt; 1000
+     or coalesce(length(p_p256dh), 0) not between 20 and 200 or coalesce(length(p_auth), 0) not between 8 and 100 then
+    raise exception 'bad_text';
+  end if;
+  insert into kk_push_subs (member_id, endpoint, p256dh, auth) values (me.id, p_endpoint, p_p256dh, p_auth)
+  on conflict (endpoint) do update set member_id = excluded.member_id, p256dh = excluded.p256dh, auth = excluded.auth;
+  -- keep at most 8 devices per person
+  delete from kk_push_subs where member_id = me.id and id not in
+    (select id from kk_push_subs where member_id = me.id order by created_at desc limit 8);
+  return json_build_object('ok', true);
+end $$;
+
+create or replace function kk_push_unsubscribe(p_token uuid, p_endpoint text) returns json
+language plpgsql security definer set search_path = public as $$
+declare me kk_members;
+begin
+  me := kk_me(p_token);
+  delete from kk_push_subs where member_id = me.id and endpoint = p_endpoint;
+  return json_build_object('ok', true);
+end $$;
+
+-- "Send a test notification" button: one message to the person's own devices.
+create or replace function kk_push_test(p_token uuid) returns json
+language plpgsql security definer set search_path = public as $$
+declare me kk_members;
+begin
+  me := kk_me(p_token);
+  if (select count(*) from kk_push_queue where member_id = me.id and created_at &gt; now() - interval '1 hour') &gt;= 10 then
+    raise exception 'too_many';
+  end if;
+  perform kk_push(array[me.id], 'Kilokampen', 'Notiserna fungerar. Bra jobbat, ' || me.name || '!', '', 'test');
+  return json_build_object('ok', true);
+end $$;
+
+-- An official answer (the owner or the developer) goes to everyone in the group; an ordinary comment goes to the writer of the post.
+create or replace function kk_on_feedback_reply() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare f kk_feedback; who uuid[];
+begin
+  select * into f from kk_feedback where id = new.feedback_id;
+  if new.official then
+    select array_agg(m.id) into who from kk_members m where m.group_id = f.group_id and m.id is distinct from new.member_id;
+    perform kk_push(who, 'Nytt svar från ' || new.author, left(new.body, 160), 'forslag', 'fb-' || f.id);
+  elsif f.member_id is not null and f.member_id is distinct from new.member_id then
+    perform kk_push(array[f.member_id], new.author || ' svarade på ditt förslag', left(new.body, 160), 'forslag', 'fb-' || f.id);
+  end if;
+  return new;
+exception when others then
+  return new;
+end $$;
+drop trigger if exists kk_feedback_reply_push on kk_feedback_replies;
+create trigger kk_feedback_reply_push after insert on kk_feedback_replies for each row execute function kk_on_feedback_reply();
+
+-- A new post goes to the group owner.
+create or replace function kk_on_feedback() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare owner uuid;
+begin
+  select owner_id into owner from kk_groups where id = new.group_id;
+  if owner is not null and owner is distinct from new.member_id then
+    perform kk_push(array[owner], 'Nytt förslag från ' || new.author, left(new.body, 160), 'forslag', 'fb-' || new.id);
+  end if;
+  return new;
+exception when others then
+  return new;
+end $$;
+drop trigger if exists kk_feedback_push on kk_feedback;
+create trigger kk_feedback_push after insert on kk_feedback for each row execute function kk_on_feedback();
+
+-- Cheers and reminders from a colleague go to that person.
+create or replace function kk_on_cheer() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare sender text;
+begin
+  select name into sender from kk_members where id = new.from_id;
+  if new.kind = 'poke' then
+    perform kk_push(array[new.to_id], sender || ' påminner dig', 'Dags att väga in den här veckan ⏰', 'hem', 'poke');
+  else
+    perform kk_push(array[new.to_id], sender || ' hejar på dig! 📣', 'Kämpa på, du gör det bra.', 'hem', 'cheer');
+  end if;
+  return new;
+exception when others then
+  return new;
+end $$;
+drop trigger if exists kk_cheer_push on kk_cheers;
+create trigger kk_cheer_push after insert on kk_cheers for each row execute function kk_on_cheer();
+
+-- Sunday reminder to everyone who has not weighed in this week (run by pg_cron, see the end of this file).
+create or replace function kk_weekly_reminder() returns void
+language plpgsql security definer set search_path = public as $$
+declare who uuid[]; monday date := date_trunc('week', (now() at time zone 'Europe/Stockholm'))::date;
+begin
+  select array_agg(m.id) into who from kk_members m
+  where not exists (select 1 from kk_weigh_ins w where w.member_id = m.id and w.date &gt;= monday);
+  perform kk_push(who, 'Veckans vikt saknas', 'Ställ dig på vågen och fyll i. Det tar tio sekunder.', 'hem', 'weigh');
+end $$;
+
+revoke all on function kk_push(uuid[], text, text, text, text), kk_on_feedback_reply(), kk_on_feedback(), kk_on_cheer(), kk_weekly_reminder()
+  from public, anon, authenticated;
+grant execute on function kk_push_subscribe(uuid, text, text, text), kk_push_unsubscribe(uuid, text), kk_push_test(uuid) to anon, authenticated;
+
 -- ---------- who may call what ----------
 revoke all on function kk_hash(text, text), kk_new_code(), kk_me(uuid), kk_check_person(text, text, numeric, numeric), kk_challenges(),
   kk_add_member(uuid, text, text, text, numeric, numeric, jsonb, jsonb), kk_open_session(uuid) from public, anon, authenticated;
@@ -579,6 +733,14 @@ grant execute on function
   kk_toggle_check(uuid, text, date), kk_cheer(uuid, uuid, text, date), kk_set_settings(uuid, text, date), kk_leave(uuid),
   kk_set_steps(uuid, date, integer), kk_set_step_goal(uuid, integer)
   to anon, authenticated;
+
+-- Sundays 16:00 UTC (17:00 or 18:00 in Sweden): the weigh-in reminder. Skipped where pg_cron is not installed.
+do $$
+begin
+  if exists (select 1 from pg_extension where extname = 'pg_cron') then
+    perform cron.schedule('kk-weekly-reminder', '0 16 * * 0', 'select public.kk_weekly_reminder()');
+  end if;
+end $$;
 
 notify pgrst, 'reload schema';
 </textarea>
