@@ -827,7 +827,8 @@ where w.member_id = m.id;
 
 -- Crowns the winner of the week that just ended: the biggest drop in percent from the last weight before the week
 -- (or the start weight) to the last weight in the week. Needs a weigh-in during the week and a real drop.
--- Also announces the final winner once the group's end date has passed. Safe to call any number of times.
+-- Also announces the final winner once the group's end date has passed: only weights up to and including the end date
+-- count, same order as finalResult in src/logic.ts (percent, then kilos, then who joined first). Safe to call any number of times.
 create or replace function kk_close_week(p_group uuid) returns void
 language plpgsql security definer set search_path = public as $$
 declare
@@ -861,12 +862,15 @@ begin
     if n = 1 then
       select m.name, round((m.start_kg - l.kg) / m.start_kg * 100, 1) as pct into w
       from kk_members m
-      join lateral (select kg from kk_weigh_ins where member_id = m.id order by date desc limit 1) l on true
-      where m.group_id = p_group order by (m.start_kg - l.kg) / m.start_kg desc limit 1;
+      join lateral (select kg from kk_weigh_ins where member_id = m.id and date &lt;= g.end_date order by date desc limit 1) l on true
+      where m.group_id = p_group and m.start_kg - l.kg &gt; 0
+      order by (m.start_kg - l.kg) / m.start_kg desc, m.start_kg - l.kg desc, m.created_at limit 1;
       select array_agg(id) into everyone from kk_members where group_id = p_group;
       if w.name is not null then
         perform kk_push(everyone, '🏁 Kampen är slut! Vinnare: ' || w.name,
-          'Ner ' || replace(to_char(w.pct, 'FM990.0'), '.', ',') || ' % sedan start. Se slutställningen.', 'hem', 'final');
+          'Ner ' || replace(to_char(w.pct, 'FM990.0'), '.', ',') || ' % sedan start. Se slutresultatet i appen.', 'hem', 'final');
+      else
+        perform kk_push(everyone, '🏁 Kampen är slut!', 'Se slutresultatet i appen. Bra kämpat, alla!', 'hem', 'final');
       end if;
     end if;
   end if;
