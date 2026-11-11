@@ -108,6 +108,32 @@ alter table kk_members add column if not exists kg_milestone int not null defaul
 alter table kk_members add column if not exists goal_told boolean not null default false;
 alter table kk_steps enable row level security;
 revoke all on kk_steps from anon, authenticated;
+-- The coach's Kvällsstopp (owner 2026-11-11): a last time to eat each evening, in minutes after midnight (Swedish time).
+alter table kk_members add column if not exists fast_on boolean not null default false;
+alter table kk_members add column if not exists fast_goal int not null default 1320;
+alter table kk_members add column if not exists fast_since date;
+alter table kk_members add column if not exists fast_tone text not null default 'hard';
+alter table kk_members add column if not exists fast_end timestamptz;
+-- One row per evening: the goal that evening, the morning answer, and (own eyes only) how long the night's fast lasted.
+create table if not exists kk_fast_days (
+  member_id uuid not null references kk_members(id) on delete cascade,
+  day date not null,
+  goal int not null,
+  result text check (result in ('yes', 'no')),
+  fasted int,
+  answered_at timestamptz,
+  primary key (member_id, day)
+);
+-- Which coach notifications went out, so each is sent once.
+create table if not exists kk_fast_sent (
+  member_id uuid not null references kk_members(id) on delete cascade,
+  day date not null,
+  kind text not null,
+  primary key (member_id, day, kind)
+);
+alter table kk_fast_days enable row level security;
+alter table kk_fast_sent enable row level security;
+revoke all on kk_fast_days, kk_fast_sent from anon, authenticated;
 
 alter table kk_groups enable row level security;
 alter table kk_members enable row level security;
@@ -230,7 +256,9 @@ begin
     'meId', me.id,
     'members', (select coalesce(json_agg(json_build_object(
         'id', m.id, 'name', m.name, 'emoji', m.emoji, 'color', m.color,
-        'startKg', m.start_kg::float8, 'goalKg', m.goal_kg::float8, 'joined', m.joined, 'stepGoal', m.step_goal) order by m.created_at), '[]'::json)
+        'startKg', m.start_kg::float8, 'goalKg', m.goal_kg::float8, 'joined', m.joined, 'stepGoal', m.step_goal,
+        'fastOn', m.fast_on, 'fastGoal', m.fast_goal,
+        'fastYes', (select count(*) from kk_fast_days d where d.member_id = m.id and d.result = 'yes')) order by m.created_at), '[]'::json)
       from kk_members m where m.group_id = g.id),
     'weighIns', (select coalesce(json_agg(json_build_object(
         'id', w.id, 'memberId', w.member_id, 'date', w.date, 'kg', w.kg::float8) order by w.date), '[]'::json)
@@ -246,6 +274,11 @@ begin
     'winners', (select coalesce(json_agg(json_build_object('weekStart', x.week_start, 'memberId', x.member_id, 'name', x.name,
         'pct', x.pct::float8, 'kg', x.kg::float8) order by x.week_start desc), '[]'::json)
       from (select * from kk_week_winners where group_id = g.id and name is not null order by week_start desc limit 26) x),
+    -- Kvällsstopp: everyone's answers (the group sees them); the length of the night's fast only for me.
+    'fastDays', (select coalesce(json_agg(json_build_object('memberId', f.member_id, 'day', f.day, 'goal', f.goal, 'result', f.result,
+        'fasted', case when f.member_id = me.id then f.fasted end) order by f.day), '[]'::json)
+      from kk_fast_days f join kk_members m on m.id = f.member_id where m.group_id = g.id and f.day &gt;= kk_day() - 35),
+    'fast', json_build_object('since', me.fast_since, 'tone', me.fast_tone, 'end', me.fast_end),
     'settings', json_build_object('groupName', g.name, 'startDate', g.start_date, 'endDate', g.end_date,
                                   'ownerId', g.owner_id, 'code', g.code),
     -- badges: answers I have not read yet, and (for the owner) posts nobody has answered officially
@@ -908,6 +941,145 @@ begin
   perform kk_push(who, 'Veckans vikt saknas', 'Ställ dig på vågen och fyll i. Det tar tio sekunder.', 'hem', 'weigh');
 end $$;
 
+-- ---------- the coach: Kvällsstopp (owner 2026-11-11) ----------
+-- Each evening has a stop time; after it the person eats nothing until they wake up. Every morning the coach asks about
+-- the evening before: yes moves the time 20 minutes earlier (never before 19:00), no keeps it. Hard words by default
+-- (the group's theme: "hård coach"), soft if the person chooses. A day rolls over at 04:00 Swedish time, so a late
+-- evening still belongs to the day it started. Same rules as fastView, answerFast and ateFast in src/logic.ts.
+create or replace function kk_day(p_at timestamptz default now()) returns date
+language sql stable set search_path = public as $$ select ((p_at at time zone 'Europe/Stockholm') - interval '4 hours')::date $$;
+
+-- The moment p_mins minutes after midnight on p_day, Swedish time.
+create or replace function kk_stop_at(p_day date, p_mins int) returns timestamptz
+language sql stable set search_path = public as $$ select (p_day::timestamp + make_interval(mins =&gt; p_mins)) at time zone 'Europe/Stockholm' $$;
+
+create or replace function kk_hhmm(p_mins int) returns text
+language sql immutable as $$ select lpad((p_mins / 60)::text, 2, '0') || ':' || lpad((p_mins % 60)::text, 2, '0') $$;
+
+-- Turn on (or start again with a new time), change the tone, or turn off. Starting makes today the first evening.
+create or replace function kk_fast_set(p_token uuid, p_on boolean, p_goal int, p_tone text) returns json
+language plpgsql security definer set search_path = public as $$
+declare me kk_members; restart boolean;
+begin
+  me := kk_me(p_token);
+  if p_on is null or p_tone is null or p_tone not in ('hard', 'soft') then raise exception 'bad_text'; end if;
+  if p_goal is null or p_goal &lt; 1140 or p_goal &gt; 1410 or p_goal % 5 &lt;&gt; 0 then raise exception 'bad_date'; end if;
+  restart := p_on and (not me.fast_on or me.fast_goal &lt;&gt; p_goal);
+  update kk_members set fast_on = p_on, fast_tone = p_tone,
+    fast_goal = case when restart then p_goal else fast_goal end,
+    fast_since = case when restart then kk_day() else fast_since end
+  where id = me.id;
+  return kk_state(p_token);
+end $$;
+
+-- The morning answer about last evening, once. Yes: 20 minutes earlier, never before 19:00. No: the same time again.
+create or replace function kk_fast_answer_at(p_member uuid, p_result text, p_now timestamptz) returns void
+language plpgsql security definer set search_path = public as $$
+declare me kk_members; d date := kk_day(p_now) - 1;
+begin
+  select * into me from kk_members where id = p_member;
+  if p_result is null or p_result not in ('yes', 'no') then raise exception 'bad_text'; end if;
+  if not me.fast_on or me.fast_since is null or me.fast_since &gt; d then raise exception 'bad_date'; end if;
+  if exists (select 1 from kk_fast_days where member_id = me.id and day = d and result is not null) then raise exception 'bad_date'; end if;
+  insert into kk_fast_days (member_id, day, goal, result, answered_at) values (me.id, d, me.fast_goal, p_result, p_now)
+  on conflict (member_id, day) do update set result = excluded.result, answered_at = excluded.answered_at;
+  if p_result = 'yes' then update kk_members set fast_goal = greatest(1140, fast_goal - 20) where id = me.id; end if;
+end $$;
+create or replace function kk_fast_answer(p_token uuid, p_result text) returns json
+language plpgsql security definer set search_path = public as $$
+begin
+  perform kk_fast_answer_at((kk_me(p_token)).id, p_result, now());
+  return kk_state(p_token);
+end $$;
+
+-- "I have eaten". In the daytime the first meal ends the night's fast and its length is kept (under 18 hours; after
+-- that the app assumes the person has eaten, see FAST_MAX in src/logic.ts).
+-- After tonight's stop it means the person ate anyway: the hours start again from now.
+create or replace function kk_fast_ate_at(p_member uuid, p_now timestamptz) returns void
+language plpgsql security definer set search_path = public as $$
+declare me kk_members; l date := kk_day(p_now); yg int; s timestamptz; start timestamptz; mins int;
+begin
+  select * into me from kk_members where id = p_member;
+  if not me.fast_on then raise exception 'bad_date'; end if;
+  if p_now &lt; kk_stop_at(l, me.fast_goal) and (me.fast_end is null or me.fast_end &lt; kk_stop_at(l, 240)) and me.fast_since &lt;= l - 1 then
+    select goal into yg from kk_fast_days where member_id = me.id and day = l - 1;
+    s := kk_stop_at(l - 1, coalesce(yg, me.fast_goal));
+    start := case when me.fast_end &gt;= s then me.fast_end else s end;
+    mins := floor(extract(epoch from p_now - start) / 60);
+    if mins &gt;= 0 and mins &lt; 1080 then
+      insert into kk_fast_days (member_id, day, goal, fasted) values (me.id, l - 1, coalesce(yg, me.fast_goal), mins)
+      on conflict (member_id, day) do update set fasted = excluded.fasted;
+    end if;
+  end if;
+  update kk_members set fast_end = p_now where id = me.id;
+end $$;
+create or replace function kk_fast_ate(p_token uuid) returns json
+language plpgsql security definer set search_path = public as $$
+begin
+  perform kk_fast_ate_at((kk_me(p_token)).id, now());
+  return kk_state(p_token);
+end $$;
+
+-- Run every five minutes by pg_cron. Each notification goes out once per person and day:
+-- 08:00–11:59 the question about last evening, 12:00–21:00 hard words if there is still no answer,
+-- and in the 30 minutes before the stop the warning.
+create or replace function kk_fast_tick(p_now timestamptz default now()) returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  l date := kk_day(p_now);
+  t timestamp := p_now at time zone 'Europe/Stockholm';
+  mins int := extract(hour from t)::int * 60 + extract(minute from t)::int;
+  v int := extract(doy from l)::int;
+  m kk_members; open boolean; hard boolean; g text; n int;
+begin
+  delete from kk_fast_sent where day &lt; l - 14;
+  for m in select * from kk_members where fast_on loop
+    hard := m.fast_tone &lt;&gt; 'soft';
+    g := kk_hhmm(m.fast_goal);
+    open := m.fast_since &lt;= l - 1
+      and not exists (select 1 from kk_fast_days d where d.member_id = m.id and d.day = l - 1 and d.result is not null);
+    if open and mins between 480 and 719 then
+      insert into kk_fast_sent values (m.id, l, 'ask') on conflict do nothing;
+      get diagnostics n = row_count;
+      if n = 1 then
+        perform kk_push(array[m.id], case when hard then 'Coachen: rapportera' else 'God morgon' end,
+          case when hard then (array[
+            'Klarade du att inte äta efter ' || g || ' i går? Ja eller nej. Svara nu.',
+            'Rapport, tack. Höll du köket stängt efter ' || g || ' i går? Inga ursäkter, bara ett svar.',
+            'Ny dag. Först: höll du ' || g || ' i går kväll? Öppna appen och svara.'])[1 + v % 3]
+          else 'Klarade du gårdagens kvällsstopp kl ' || g || '? Svara i appen.' end, 'coach', 'fast-ask');
+      end if;
+    elsif open and mins between 720 and 1260 then
+      insert into kk_fast_sent values (m.id, l, 'nag') on conflict do nothing;
+      get diagnostics n = row_count;
+      if n = 1 then
+        perform kk_push(array[m.id], case when hard then 'Du har inte svarat' else 'Glömde du?' end,
+          case when hard then (array[
+            'Tystnad är också ett svar, och det är fel svar. Klarade du ' || g || ' i går?',
+            'Vinnare rapporterar. De andra gömmer sig. Vilken är du? Svara nu.',
+            'Coachen väntar fortfarande. Ett tryck: ja eller nej. Nu.'])[1 + v % 3]
+          else 'Svara gärna om gårdagens kvällsstopp kl ' || g || '.' end, 'coach', 'fast-ask');
+      end if;
+    end if;
+    if mins &gt;= m.fast_goal - 30 and mins &lt; m.fast_goal then
+      insert into kk_fast_sent values (m.id, l, 'warn') on conflict do nothing;
+      get diagnostics n = row_count;
+      if n = 1 then
+        perform kk_push(array[m.id], case when hard then '30 minuter kvar' else 'Snart kvällsstopp' end,
+          case when hard then (array[
+            'Kl ' || g || ' stänger köket. Sedan inget förrän du vaknar. Inte en bit.',
+            'Om 30 minuter, kl ' || g || ', är det slut för i kväll. Ät klart nu eller låt bli.',
+            g || ' är gränsen. Efter det: vatten, te eller sömn. Inget annat.'])[1 + v % 3]
+          else 'Ditt kvällsstopp är kl ' || g || '. 30 minuter kvar.' end, 'coach', 'fast-warn');
+      end if;
+    end if;
+  end loop;
+end $$;
+
+revoke all on function kk_day(timestamptz), kk_stop_at(date, int), kk_hhmm(int), kk_fast_answer_at(uuid, text, timestamptz),
+  kk_fast_ate_at(uuid, timestamptz), kk_fast_tick(timestamptz) from public, anon, authenticated;
+grant execute on function kk_fast_set(uuid, boolean, integer, text), kk_fast_answer(uuid, text), kk_fast_ate(uuid) to anon, authenticated;
+
 revoke all on function kk_push(uuid[], text, text, text, text), kk_on_feedback_reply(), kk_on_feedback(), kk_on_cheer(), kk_weekly_reminder(),
   kk_others(uuid), kk_celebrate(uuid), kk_on_member(), kk_close_week(uuid), kk_close_all_weeks(), kk_announce(text, text)
   from public, anon, authenticated;
@@ -933,6 +1105,8 @@ begin
     perform cron.schedule('kk-weekly-reminder', '0 16 * * 0', 'select public.kk_weekly_reminder()');
     -- Mondays 05:10 UTC (06:10 or 07:10 in Sweden): crown last week's winner.
     perform cron.schedule('kk-weekly-winner', '10 5 * * 1', 'select public.kk_close_all_weeks()');
+    -- Every five minutes: the coach's Kvällsstopp notifications (each goes out once per person and day).
+    perform cron.schedule('kk-fast-coach', '*/5 * * * *', 'select public.kk_fast_tick()');
   end if;
 end $$;
 
