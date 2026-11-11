@@ -88,6 +88,21 @@ create table if not exists kk_steps (
   steps int not null,
   primary key (member_id, date)
 );
+-- The winner of each finished week (Monday to Sunday, Swedish time). A row without a member means "nobody won".
+create table if not exists kk_week_winners (
+  group_id uuid not null references kk_groups(id) on delete cascade,
+  week_start date not null,
+  member_id uuid references kk_members(id) on delete set null,
+  name text,
+  pct numeric(5,2),
+  kg numeric(5,1),
+  created_at timestamptz not null default now(),
+  primary key (group_id, week_start)
+);
+alter table kk_week_winners enable row level security;
+revoke all on kk_week_winners from anon, authenticated;
+alter table kk_groups add column if not exists end_told boolean not null default false;
+
 -- What has already been announced to the group, so that a milestone is only celebrated once.
 alter table kk_members add column if not exists kg_milestone int not null default 0;
 alter table kk_members add column if not exists goal_told boolean not null default false;
@@ -208,6 +223,7 @@ language plpgsql security definer set search_path = public as $$
 declare me kk_members; g kk_groups;
 begin
   me := kk_me(p_token);
+  perform kk_close_week(me.group_id);
   select * into g from kk_groups where id = me.group_id;
   return json_build_object(
     'v', 1,
@@ -227,6 +243,9 @@ begin
       from kk_cheers c join kk_members m on m.id = c.to_id where m.group_id = g.id),
     'steps', (select coalesce(json_agg(json_build_object('memberId', st.member_id, 'date', st.date, 'steps', st.steps)), '[]'::json)
       from kk_steps st join kk_members m on m.id = st.member_id where m.group_id = g.id and st.date &gt;= current_date - 60),
+    'winners', (select coalesce(json_agg(json_build_object('weekStart', x.week_start, 'memberId', x.member_id, 'name', x.name,
+        'pct', x.pct::float8, 'kg', x.kg::float8) order by x.week_start desc), '[]'::json)
+      from (select * from kk_week_winners where group_id = g.id and name is not null order by week_start desc limit 26) x),
     'settings', json_build_object('groupName', g.name, 'startDate', g.start_date, 'endDate', g.end_date,
                                   'ownerId', g.owner_id, 'code', g.code),
     -- badges: answers I have not read yet, and (for the owner) posts nobody has answered officially
@@ -767,6 +786,75 @@ update kk_members m set
 from (select distinct on (member_id) member_id, kg from kk_weigh_ins order by member_id, date desc) w
 where w.member_id = m.id;
 
+-- Crowns the winner of the week that just ended: the biggest drop in percent from the last weight before the week
+-- (or the start weight) to the last weight in the week. Needs a weigh-in during the week and a real drop.
+-- Also announces the final winner once the group's end date has passed. Safe to call any number of times.
+create or replace function kk_close_week(p_group uuid) returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  today date := (now() at time zone 'Europe/Stockholm')::date;
+  mon date := date_trunc('week', (now() at time zone 'Europe/Stockholm'))::date - 7;
+  w record; g kk_groups; n int; everyone uuid[];
+begin
+  if not exists (select 1 from kk_week_winners where group_id = p_group and week_start = mon) then
+    select m.id, m.name, round((b.base - e.kg) / b.base * 100, 2) as pct, round(b.base - e.kg, 1) as kg into w
+    from kk_members m
+    join lateral (select kg from kk_weigh_ins where member_id = m.id and date between mon and mon + 6 order by date desc limit 1) e on true
+    join lateral (select coalesce((select kg from kk_weigh_ins where member_id = m.id and date &lt; mon order by date desc limit 1), m.start_kg) as base) b on true
+    where m.group_id = p_group and b.base - e.kg &gt; 0
+    order by (b.base - e.kg) / b.base desc, b.base - e.kg desc, m.created_at
+    limit 1;
+    insert into kk_week_winners (group_id, week_start, member_id, name, pct, kg) values (p_group, mon, w.id, w.name, w.pct, w.kg)
+    on conflict do nothing;
+    get diagnostics n = row_count;
+    if n = 1 and w.id is not null then
+      select array_agg(id) into everyone from kk_members where group_id = p_group;
+      perform kk_push(everyone, '👑 Veckans vinnare: ' || w.name,
+        'Ner ' || replace(to_char(w.pct, 'FM990.0'), '.', ',') || ' % förra veckan (' || replace(to_char(w.kg, 'FM990.0'), '.', ',') || ' kg). Grattis!',
+        'hem', 'week-' || mon);
+    end if;
+  end if;
+
+  select * into g from kk_groups where id = p_group;
+  if g.end_date is not null and g.end_date &lt; today and not g.end_told then
+    update kk_groups set end_told = true where id = p_group and not end_told;
+    get diagnostics n = row_count;
+    if n = 1 then
+      select m.name, round((m.start_kg - l.kg) / m.start_kg * 100, 1) as pct into w
+      from kk_members m
+      join lateral (select kg from kk_weigh_ins where member_id = m.id order by date desc limit 1) l on true
+      where m.group_id = p_group order by (m.start_kg - l.kg) / m.start_kg desc limit 1;
+      select array_agg(id) into everyone from kk_members where group_id = p_group;
+      if w.name is not null then
+        perform kk_push(everyone, '🏁 Kampen är slut! Vinnare: ' || w.name,
+          'Ner ' || replace(to_char(w.pct, 'FM990.0'), '.', ',') || ' % sedan start. Se slutställningen.', 'hem', 'final');
+      end if;
+    end if;
+  end if;
+exception when others then
+  null;
+end $$;
+
+-- Run by pg_cron on Monday mornings, so the winner is announced even if nobody has opened the app yet.
+create or replace function kk_close_all_weeks() returns void
+language plpgsql security definer set search_path = public as $$
+declare gid uuid;
+begin
+  for gid in select id from kk_groups loop
+    perform kk_close_week(gid);
+  end loop;
+end $$;
+
+-- News about the app itself, to everyone with notifications on (used by the developer after publishing an update).
+create or replace function kk_announce(p_title text, p_body text) returns int
+language plpgsql security definer set search_path = public as $$
+declare everyone uuid[];
+begin
+  select array_agg(id) into everyone from kk_members;
+  perform kk_push(everyone, p_title, p_body, 'mer', 'update');
+  return (select count(*) from kk_push_queue where tag = 'update' and created_at &gt; now() - interval '5 seconds')::int;
+end $$;
+
 -- Sunday reminder to everyone who has not weighed in this week (run by pg_cron, see the end of this file).
 create or replace function kk_weekly_reminder() returns void
 language plpgsql security definer set search_path = public as $$
@@ -778,7 +866,8 @@ begin
 end $$;
 
 revoke all on function kk_push(uuid[], text, text, text, text), kk_on_feedback_reply(), kk_on_feedback(), kk_on_cheer(), kk_weekly_reminder(),
-  kk_others(uuid), kk_celebrate(uuid), kk_on_member() from public, anon, authenticated;
+  kk_others(uuid), kk_celebrate(uuid), kk_on_member(), kk_close_week(uuid), kk_close_all_weeks(), kk_announce(text, text)
+  from public, anon, authenticated;
 grant execute on function kk_push_subscribe(uuid, text, text, text), kk_push_unsubscribe(uuid, text), kk_push_test(uuid) to anon, authenticated;
 
 -- ---------- who may call what ----------
@@ -798,6 +887,8 @@ do $$
 begin
   if exists (select 1 from pg_extension where extname = 'pg_cron') then
     perform cron.schedule('kk-weekly-reminder', '0 16 * * 0', 'select public.kk_weekly_reminder()');
+    -- Mondays 05:10 UTC (06:10 or 07:10 in Sweden): crown last week's winner.
+    perform cron.schedule('kk-weekly-winner', '10 5 * * 1', 'select public.kk_close_all_weeks()');
   end if;
 end $$;
 
