@@ -1400,7 +1400,7 @@ grant execute on function kk_seen(uuid, int, boolean) to anon, authenticated;
 -- for a day; no version at all means before version numbers, that is 28 or older), nopush, silent (owner 2026-11-12,
 -- "uppmuntra folk att fylla i detta, viktigt": has the evening stop but left the coach's morning question unanswered
 -- all of yesterday), nostop (no evening stop), noapp (has opened Kilokampen but never as the installed app). Peace on
--- the day someone joins, nothing after the end date. kk_state shows the same list in More; it is never about anyone's body.
+-- the day someone joins, nothing after the end date. kk_state shows the same list on the coach's page (the team); it is never about anyone's body.
 create or replace function kk_help(p_group uuid, p_now timestamptz default now()) returns jsonb
 language plpgsql stable security definer set search_path = public as $$
 declare
@@ -1449,11 +1449,11 @@ begin
         'Geride kaldı: ' || nm,
         nm || ' uzun zamandır girmedi, eski sürümü kullanıyor. Söyle: uygulamayı hemen açsın. Koç bekliyor, sabır tükendi.')
       when 'nopush' then kk_msg(nm || ' hör mig inte',
-        nm || ' har inga notiser på. Jag kan inte coacha någon som inte hör mig. Säg till: slå på notiserna under Mer. I dag.',
+        nm || ' har inga notiser på. Jag kan inte coacha någon som inte hör mig. Säg till: slå på notiserna under ⚙️ Inställningar. I dag.',
         nm || ' can’t hear me',
-        nm || ' has notifications off. I can’t coach someone who can’t hear me. Tell them: turn notifications on under More. Today.',
+        nm || ' has notifications off. I can’t coach someone who can’t hear me. Tell them: turn notifications on under ⚙️ Settings. Today.',
         'Beni duymuyor: ' || nm,
-        nm || ' bildirimleri kapalı. Beni duymayan birine koçluk yapamam. Söyle: Diğer sayfasından bildirimleri açsın. Bugün.')
+        nm || ' bildirimleri kapalı. Beni duymayan birine koçluk yapamam. Söyle: ⚙️ Ayarlar’dan bildirimleri açsın. Bugün.')
       when 'silent' then kk_msg(nm || ' svarar inte coachen',
         nm || ' hoppade över min fråga om kvällsstoppet i går. Tystnad är fusk. Säg till: svara mig varje morgon. Ett tryck, ja eller nej.',
         nm || ' isn’t answering the coach',
@@ -1467,11 +1467,11 @@ begin
         'Akşam sınırı yok: ' || nm,
         nm || ' hâlâ akşam sınırını başlatmadı. Söyle: ana sayfada koça dokunsun ve bir saat seçsin. On saniye. Bugün.')
       else kk_msg(nm || ' sitter fast i webbläsaren',
-        nm || ' har inte installerat appen. Säg till: lägg den på hemskärmen under Mer. Det tar en minut. Ursäkter tar längre.',
+        nm || ' har inte installerat appen. Säg till: lägg den på hemskärmen under ⚙️ Inställningar. Det tar en minut. Ursäkter tar längre.',
         nm || ' is stuck in the browser',
-        nm || ' hasn’t installed the app. Tell them: put it on the home screen under More. It takes a minute. Excuses take longer.',
+        nm || ' hasn’t installed the app. Tell them: put it on the home screen under ⚙️ Settings. It takes a minute. Excuses take longer.',
         'Hâlâ tarayıcıda: ' || nm,
-        nm || ' uygulamayı yüklemedi. Söyle: Diğer sayfasından ana ekrana eklesin. Bir dakika sürer. Bahaneler daha uzun.')
+        nm || ' uygulamayı yüklemedi. Söyle: ⚙️ Ayarlar’dan ana ekrana eklesin. Bir dakika sürer. Bahaneler daha uzun.')
     end;
   end if;
   select string_agg(x -&gt;&gt; 'name' || ': ' || case x -&gt;&gt; 'k' when 'gone' then 'logga in, jag väntar' when 'old' then 'öppna appen, jag väntar'
@@ -1507,7 +1507,7 @@ begin
       select coalesce(jsonb_agg(x order by i), '[]'::jsonb) into mine
         from jsonb_array_elements(list) with ordinality t(x, i) where x -&gt;&gt; 'id' &lt;&gt; r.id::text;
       continue when jsonb_array_length(mine) = 0;
-      perform kk_push_i18n(array[r.id], kk_help_msg(mine), 'mer', 'coach-help');
+      perform kk_push_i18n(array[r.id], kk_help_msg(mine), 'coach', 'coach-help');
       n := n + 1;
     end loop;
     insert into kk_fast_sent (member_id, day, kind) select (x -&gt;&gt; 'id')::uuid, d, 'help' from jsonb_array_elements(list) x
