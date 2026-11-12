@@ -264,7 +264,7 @@ begin
     'members', (select coalesce(json_agg(json_build_object(
         'id', m.id, 'name', m.name, 'emoji', m.emoji, 'color', m.color,
         'startKg', m.start_kg::float8, 'goalKg', m.goal_kg::float8, 'joined', m.joined, 'stepGoal', m.step_goal,
-        'fastOn', m.fast_on, 'fastGoal', m.fast_goal, 'lang', m.lang, 'version', m.app_version, 'seen', m.app_seen, 'app', m.app_installed,
+        'fastOn', m.fast_on, 'fastGoal', m.fast_goal, 'fastSince', m.fast_since, 'lang', m.lang, 'version', m.app_version, 'seen', m.app_seen, 'app', m.app_installed,
         'appSince', m.app_since, 'push', exists (select 1 from kk_push_subs s where s.member_id = m.id),
         'fastYes', (select count(*) from kk_fast_days d where d.member_id = m.id and d.result = 'yes')) order by m.created_at), '[]'::json)
       from kk_members m where m.group_id = g.id),
@@ -1397,13 +1397,14 @@ grant execute on function kk_seen(uuid, int, boolean) to anon, authenticated;
 -- "Be de andra i gruppen hjälpa dig säga till": whoever has gone quiet, runs an old version, has no notifications or no
 -- app is named to the rest of the group, who are told to go and say it (they are colleagues). One thing per person, most
 -- important first: gone (app not opened for 3+ days), old (5+ versions behind the newest anyone opened, and not opened
--- for a day; no version at all means before version numbers, that is 28 or older), nopush, noapp (has opened Kilokampen
--- but never as the installed app). Peace on the day someone joins, nothing after the end date. kk_state shows the same
--- list in More; it is never about anyone's body.
+-- for a day; no version at all means before version numbers, that is 28 or older), nopush, silent (owner 2026-11-12,
+-- "uppmuntra folk att fylla i detta, viktigt": has the evening stop but left the coach's morning question unanswered
+-- all of yesterday), nostop (no evening stop), noapp (has opened Kilokampen but never as the installed app). Peace on
+-- the day someone joins, nothing after the end date. kk_state shows the same list in More; it is never about anyone's body.
 create or replace function kk_help(p_group uuid, p_now timestamptz default now()) returns jsonb
 language plpgsql stable security definer set search_path = public as $$
 declare
-  g kk_groups; m kk_members; d date := (p_now at time zone 'Europe/Stockholm')::date;
+  g kk_groups; m kk_members; d date := (p_now at time zone 'Europe/Stockholm')::date; l date := kk_day(p_now);
   newest int := coalesce((select max(app_version) from kk_members), 0); seen date; r jsonb := '[]'::jsonb; k text; n int;
 begin
   select * into g from kk_groups where id = p_group;
@@ -1415,11 +1416,15 @@ begin
     elsif coalesce(m.app_version, 28) &lt;= newest - 5 and (m.app_seen is null or m.app_seen &lt; p_now - interval '1 day') then
       k := 'old'; n := m.app_version;
     elsif not exists (select 1 from kk_push_subs s where s.member_id = m.id) then k := 'nopush';
+    elsif m.fast_on and m.fast_since &lt;= l - 2
+          and not exists (select 1 from kk_fast_days f where f.member_id = m.id and f.day = l - 2 and f.result is not null) then
+      k := 'silent';
+    elsif not m.fast_on then k := 'nostop';
     elsif m.app_since is null and m.app_seen is not null then k := 'noapp';
     end if;
     if k is not null then r := r || jsonb_build_array(jsonb_build_object('id', m.id, 'name', m.name, 'k', k, 'n', n)); end if;
   end loop;
-  return (select coalesce(jsonb_agg(x order by array_position(array['gone', 'old', 'nopush', 'noapp'], x -&gt;&gt; 'k'), i), '[]'::jsonb)
+  return (select coalesce(jsonb_agg(x order by array_position(array['gone', 'old', 'nopush', 'silent', 'nostop', 'noapp'], x -&gt;&gt; 'k'), i), '[]'::jsonb)
     from jsonb_array_elements(r) with ordinality t(x, i));
 end $$;
 
@@ -1449,6 +1454,18 @@ begin
         nm || ' has notifications off. I can’t coach someone who can’t hear me. Tell them: turn notifications on under More. Today.',
         'Beni duymuyor: ' || nm,
         nm || ' bildirimleri kapalı. Beni duymayan birine koçluk yapamam. Söyle: Diğer sayfasından bildirimleri açsın. Bugün.')
+      when 'silent' then kk_msg(nm || ' svarar inte coachen',
+        nm || ' hoppade över min fråga om kvällsstoppet i går. Tystnad är fusk. Säg till: svara mig varje morgon. Ett tryck, ja eller nej.',
+        nm || ' isn’t answering the coach',
+        nm || ' skipped my question about the evening stop yesterday. Silence is cheating. Tell them: answer me every morning. One tap, yes or no.',
+        'Koça cevap vermiyor: ' || nm,
+        nm || ' dün akşam sınırı hakkındaki soruma cevap vermedi. Sessizlik hiledir. Söyle: her sabah bana cevap versin. Tek dokunuş, evet ya da hayır.')
+      when 'nostop' then kk_msg(nm || ' har inget kvällsstopp',
+        nm || ' har fortfarande inte startat kvällsstoppet. Säg till: tryck på Coachen på startsidan och välj en tid. Tio sekunder. I dag.',
+        nm || ' has no evening stop',
+        nm || ' still hasn’t started the evening stop. Tell them: tap the coach on the home page and pick a time. Ten seconds. Today.',
+        'Akşam sınırı yok: ' || nm,
+        nm || ' hâlâ akşam sınırını başlatmadı. Söyle: ana sayfada koça dokunsun ve bir saat seçsin. On saniye. Bugün.')
       else kk_msg(nm || ' sitter fast i webbläsaren',
         nm || ' har inte installerat appen. Säg till: lägg den på hemskärmen under Mer. Det tar en minut. Ursäkter tar längre.',
         nm || ' is stuck in the browser',
@@ -1458,11 +1475,14 @@ begin
     end;
   end if;
   select string_agg(x -&gt;&gt; 'name' || ': ' || case x -&gt;&gt; 'k' when 'gone' then 'logga in, jag väntar' when 'old' then 'öppna appen, jag väntar'
-           when 'nopush' then 'slå på notiserna' else 'installera appen' end, '. ' order by i),
+           when 'nopush' then 'slå på notiserna' when 'silent' then 'svara coachen varje morgon'
+           when 'nostop' then 'starta kvällsstoppet' else 'installera appen' end, '. ' order by i),
          string_agg(x -&gt;&gt; 'name' || ': ' || case x -&gt;&gt; 'k' when 'gone' then 'sign in, I’m waiting' when 'old' then 'open the app, I’m waiting'
-           when 'nopush' then 'turn notifications on' else 'install the app' end, '. ' order by i),
+           when 'nopush' then 'turn notifications on' when 'silent' then 'answer the coach every morning'
+           when 'nostop' then 'start the evening stop' else 'install the app' end, '. ' order by i),
          string_agg(x -&gt;&gt; 'name' || ': ' || case x -&gt;&gt; 'k' when 'gone' then 'giriş yap, bekliyorum' when 'old' then 'uygulamayı aç, bekliyorum'
-           when 'nopush' then 'bildirimleri aç' else 'uygulamayı yükle' end, '. ' order by i)
+           when 'nopush' then 'bildirimleri aç' when 'silent' then 'her sabah koça cevap ver'
+           when 'nostop' then 'akşam sınırını başlat' else 'uygulamayı yükle' end, '. ' order by i)
     into sv, en, tr from jsonb_array_elements(p_list) with ordinality t(x, i) where i &lt;= 4;
   return kk_msg('Coachen behöver din hjälp', 'Säg till dem i dag. ' || sv || '. Ingen lämnas kvar.',
     'The coach needs your help', 'Tell them today. ' || en || '. Nobody gets left behind.',
