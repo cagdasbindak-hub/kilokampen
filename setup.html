@@ -190,7 +190,10 @@ end $$;
 
 create or replace function kk_challenges() returns text[]
 language sql immutable as $$ select array['steps','soda','stairs','water','greens','evening','walk','sweets','sleep','protein','fruit','fastfood',
-  'cook','workout','alcohol','slow','lunchbox','stretch','commute','portion'] $$;
+  'cook','workout','alcohol','slow','lunchbox','stretch','commute','portion',
+  'veggies5','coffee','standup','pushups','squats','plank','daylight','screens','plan','snack','chips','wholegrain',
+  'fish','beans','dinnerwalk','glass','crunch','together','cheer','wait','steps10','park','walkcall','list',
+  'veggieday','balance','lunch','oats'] $$;
 
 create or replace function kk_add_member(p_group uuid, p_name text, p_emoji text, p_pin text, p_start numeric, p_goal numeric,
                                          p_weighins jsonb, p_checks jsonb) returns uuid
@@ -271,6 +274,10 @@ begin
     'checks', (select coalesce(json_agg(json_build_object(
         'memberId', c.member_id, 'challengeId', c.challenge_id, 'date', c.date)), '[]'::json)
       from kk_checks c join kk_members m on m.id = c.member_id where m.group_id = g.id),
+    -- What everyone thinks of the challenges; the reason for a "not for me" only for the person who gave it.
+    'votes', (select coalesce(json_agg(json_build_object('memberId', v.member_id, 'challengeId', v.challenge_id, 'vote', v.vote,
+        'reason', case when v.member_id = me.id then v.reason end, 'at', v.at) order by v.at), '[]'::json)
+      from kk_challenge_votes v join kk_members m on m.id = v.member_id where m.group_id = g.id),
     'cheers', (select coalesce(json_agg(json_build_object(
         'id', c.id, 'from', c.from_id, 'to', c.to_id, 'date', c.date, 'kind', c.kind) order by c.date), '[]'::json)
       from kk_cheers c join kk_members m on m.id = c.to_id where m.group_id = g.id),
@@ -1228,7 +1235,8 @@ end $$;
 -- What the coach sees for one person today, most important first. Hard on effort, excuses and silence; never on
 -- anyone's body. Items: quiet (app not opened for 3+ days), weigh (no weigh-in this week, from Thursday), eat (ate after
 -- the evening stop on 2 of the last 3 evenings), steps (written steps under 80 % of the goal), nosteps (stopped writing
--- steps), move (never writes steps), challenge (nothing ticked for 3 days), nostop (no evening stop).
+-- steps), move (never writes steps), challenge (nothing ticked for 3 days; chno instead when the person also said "not for
+-- me" to 3+ challenges in the last week; chfav when favourites from 3+ days ago got no tick for 3 days), nostop (no evening stop).
 -- p_notify: for the daily notification some reminders only come on certain weekdays, so nobody gets the same one every
 -- day; the app (p_notify false) shows everything that is true now.
 create or replace function kk_watch(p_member uuid, p_now timestamptz default now(), p_notify boolean default false) returns jsonb
@@ -1238,7 +1246,7 @@ declare
   d date := (p_now at time zone 'Europe/Stockholm')::date;
   l date := kk_day(p_now);
   dow int := extract(isodow from (p_now at time zone 'Europe/Stockholm'))::int;
-  r jsonb := '[]'::jsonb; nos int; logged int; avg_steps int; seen date;
+  r jsonb := '[]'::jsonb; nos int; logged int; avg_steps int; seen date; said_no int; ticked boolean;
 begin
   select * into m from kk_members where id = p_member;
   -- Peace on the day someone joins, and nothing after the end of the competition.
@@ -1269,7 +1277,15 @@ begin
       r := r || jsonb_build_array(jsonb_build_object('k', 'move', 'goal', m.step_goal));
     end if;
   end if;
-  if not exists (select 1 from kk_checks c where c.member_id = m.id and c.date between d - 2 and d) then
+  select count(*) into said_no from kk_challenge_votes v where v.member_id = m.id and v.vote = 'no' and v.at &gt; p_now - interval '7 days';
+  ticked := exists (select 1 from kk_checks c where c.member_id = m.id and c.date between d - 2 and d);
+  if not ticked and said_no &gt;= 3 then
+    r := r || jsonb_build_array(jsonb_build_object('k', 'chno', 'n', said_no));
+  elsif exists (select 1 from kk_challenge_votes v where v.member_id = m.id and v.vote = 'yes' and v.at &lt;= p_now - interval '3 days')
+    and not exists (select 1 from kk_checks c join kk_challenge_votes v on v.member_id = c.member_id and v.challenge_id = c.challenge_id
+                    where c.member_id = m.id and v.vote = 'yes' and c.date between d - 2 and d) then
+    r := r || jsonb_build_array(jsonb_build_object('k', 'chfav'));
+  elsif not ticked then
     r := r || jsonb_build_array(jsonb_build_object('k', 'challenge'));
   end if;
   if not m.fast_on and (not p_notify or dow in (1, 3, 5)) then
@@ -1317,6 +1333,14 @@ begin
       'Inga utmaningar', 'Tre dagar utan en enda avbockad utmaning. Välj en i dag och gör den. Nu.',
       'No challenges', 'Three days without a single challenge ticked. Pick one today and do it. Now.',
       'Görev yok', 'Üç gündür tek bir görev işaretlemedin. Bugün birini seç ve yap. Şimdi.')
+    when 'chno' then kk_msg(
+      'Nej, nej, nej', 'Du har sagt nej till ' || n || ' utmaningar på en vecka och bockat noll. Det finns fler att välja på. Välj en och gör den. I dag.',
+      'No, no, no', 'You said no to ' || n || ' challenges in a week and ticked none. There are more to choose from. Pick one and do it. Today.',
+      'Hayır, hayır, hayır', 'Bir haftada ' || n || ' göreve hayır dedin ve hiçbirini işaretlemedin. Seçecek daha çok şey var. Birini seç ve yap. Bugün.')
+    when 'chfav' then kk_msg(
+      'Snack eller verkstad?', 'Intressant, sa du. Tre dagar utan en bock på dina favoriter. Ord är billiga. Gör en i dag.',
+      'Talk or action?', 'Interesting, you said. Three days without a tick on your favourites. Words are cheap. Do one today.',
+      'Laf mı, iş mi?', 'İlginç demiştin. Üç gündür favorilerinden hiçbirini işaretlemedin. Laf ucuz. Bugün birini yap.')
     else kk_msg(
       'Du behöver fasta mer', 'Du har inget kvällsstopp. De andra stänger köket varje kväll. Starta i kväll, det tar tio sekunder.',
       'You need to fast more', 'You have no evening stop. The others close the kitchen every evening. Start tonight, it takes ten seconds.',
@@ -1334,7 +1358,9 @@ begin
     continue when jsonb_array_length(w) = 0;
     insert into kk_fast_sent (member_id, day, kind) values (m.id, d, 'watch') on conflict do nothing returning code into c;
     continue when c is null;
-    perform kk_push_i18n(array[m.id], kk_watch_msg(w -&gt; 0), 'coach', 'coach-watch');
+    -- Challenge reminders open the challenges, everything else the coach.
+    perform kk_push_i18n(array[m.id], kk_watch_msg(w -&gt; 0),
+      case when w -&gt; 0 -&gt;&gt; 'k' in ('challenge', 'chno', 'chfav') then 'utmaningar' else 'coach' end, 'coach-watch');
     n := n + 1;
   end loop;
   return n;
@@ -1482,6 +1508,42 @@ revoke all on function kk_push(uuid[], text, text, text, text), kk_on_feedback_r
   kk_others(uuid), kk_celebrate(uuid), kk_on_member(), kk_close_week(uuid), kk_close_all_weeks(), kk_announce(text, text)
   from public, anon, authenticated;
 grant execute on function kk_push_subscribe(uuid, text, text, text), kk_push_unsubscribe(uuid, text), kk_push_test(uuid) to anon, authenticated;
+
+-- ---------- what people think of the challenges (owner 2026-11-12) ----------
+-- On every challenge: "Intressant" (yes: kept every week as a favourite) or "Inte för mig" (no, with a reason: swapped for
+-- another one in the app). Everyone in the group sees who said what; the reason only the person who gave it, and the
+-- developer, who reads the reasons to improve the list. The coach follows up through kk_watch ('chno', 'chfav').
+create table if not exists kk_challenge_votes (
+  member_id uuid not null references kk_members(id) on delete cascade,
+  challenge_id text not null,
+  vote text not null check (vote in ('yes', 'no')),
+  reason text check (reason in ('hard', 'notme', 'already', 'boring')),
+  at timestamptz not null default now(),
+  primary key (member_id, challenge_id)
+);
+alter table kk_challenge_votes enable row level security;
+revoke all on kk_challenge_votes from anon, authenticated;
+
+-- Interesting ('yes'), not for me ('no', optionally with a reason), or take the answer back (null).
+create or replace function kk_vote_challenge(p_token uuid, p_challenge text, p_vote text, p_reason text default null) returns json
+language plpgsql security definer set search_path = public as $$
+declare me kk_members;
+begin
+  me := kk_me(p_token);
+  if p_challenge is null or not (p_challenge = any (kk_challenges())) then raise exception 'bad_challenge'; end if;
+  if p_vote is not null and p_vote not in ('yes', 'no') then raise exception 'bad_text'; end if;
+  if p_reason is not null and (p_vote is distinct from 'no' or p_reason not in ('hard', 'notme', 'already', 'boring')) then
+    raise exception 'bad_text';
+  end if;
+  if p_vote is null then
+    delete from kk_challenge_votes where member_id = me.id and challenge_id = p_challenge;
+  else
+    insert into kk_challenge_votes (member_id, challenge_id, vote, reason) values (me.id, p_challenge, p_vote, p_reason)
+    on conflict (member_id, challenge_id) do update set vote = excluded.vote, reason = excluded.reason, at = now();
+  end if;
+  return kk_state(p_token);
+end $$;
+grant execute on function kk_vote_challenge(uuid, text, text, text) to anon, authenticated;
 
 -- ---------- who may call what ----------
 revoke all on function kk_hash(text, text), kk_new_code(), kk_me(uuid), kk_check_person(text, text, numeric, numeric), kk_challenges(),
