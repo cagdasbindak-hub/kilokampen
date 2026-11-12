@@ -286,6 +286,8 @@ begin
     'fast', json_build_object('since', me.fast_since, 'tone', me.fast_tone, 'end', me.fast_end),
     -- What the coach sees for each person in the group today (the group sees it all, like everything else).
     'watch', (select coalesce(jsonb_object_agg(m.id, kk_watch(m.id)), '{}'::jsonb) from kk_members m where m.group_id = g.id),
+    -- Whoever the coach needs the group's help with (gone, old version, no notifications, no app).
+    'help', kk_help(g.id),
     'settings', json_build_object('groupName', g.name, 'startDate', g.start_date, 'endDate', g.end_date,
                                   'ownerId', g.owner_id, 'code', g.code),
     -- badges: answers I have not read yet, and (for the owner) posts nobody has answered officially
@@ -1364,6 +1366,110 @@ begin
 end $$;
 grant execute on function kk_seen(uuid, int, boolean) to anon, authenticated;
 
+-- ---------- the coach asks the group for help (owner 2026-11-12) ----------
+-- "Be de andra i gruppen hjälpa dig säga till": whoever has gone quiet, runs an old version, has no notifications or no
+-- app is named to the rest of the group, who are told to go and say it (they are colleagues). One thing per person, most
+-- important first: gone (app not opened for 3+ days), old (5+ versions behind the newest anyone opened, and not opened
+-- for a day; no version at all means before version numbers, that is 28 or older), nopush, noapp (has opened Kilokampen
+-- but never as the installed app). Peace on the day someone joins, nothing after the end date. kk_state shows the same
+-- list in More; it is never about anyone's body.
+create or replace function kk_help(p_group uuid, p_now timestamptz default now()) returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+declare
+  g kk_groups; m kk_members; d date := (p_now at time zone 'Europe/Stockholm')::date;
+  newest int := coalesce((select max(app_version) from kk_members), 0); seen date; r jsonb := '[]'::jsonb; k text; n int;
+begin
+  select * into g from kk_groups where id = p_group;
+  if g.id is null or (g.end_date is not null and g.end_date &lt; d) then return r; end if;
+  for m in select * from kk_members where group_id = g.id and joined &lt; d order by created_at loop
+    seen := (m.app_seen at time zone 'Europe/Stockholm')::date;
+    k := null; n := null;
+    if seen is not null and seen &lt;= d - 3 then k := 'gone'; n := d - seen;
+    elsif coalesce(m.app_version, 28) &lt;= newest - 5 and (m.app_seen is null or m.app_seen &lt; p_now - interval '1 day') then
+      k := 'old'; n := m.app_version;
+    elsif not exists (select 1 from kk_push_subs s where s.member_id = m.id) then k := 'nopush';
+    elsif m.app_since is null and m.app_seen is not null then k := 'noapp';
+    end if;
+    if k is not null then r := r || jsonb_build_array(jsonb_build_object('id', m.id, 'name', m.name, 'k', k, 'n', n)); end if;
+  end loop;
+  return (select coalesce(jsonb_agg(x order by array_position(array['gone', 'old', 'nopush', 'noapp'], x -&gt;&gt; 'k'), i), '[]'::jsonb)
+    from jsonb_array_elements(r) with ordinality t(x, i));
+end $$;
+
+-- The coach's words to the rest of the group: one person → what is wrong and what to say; more → one line each.
+create or replace function kk_help_msg(p_list jsonb) returns jsonb
+language plpgsql immutable as $$
+declare nm text := p_list -&gt; 0 -&gt;&gt; 'name'; d text := coalesce(p_list -&gt; 0 -&gt;&gt; 'n', ''); sv text; en text; tr text;
+begin
+  if p_list is null or jsonb_typeof(p_list) &lt;&gt; 'array' or jsonb_array_length(p_list) = 0 then return null; end if;
+  if jsonb_array_length(p_list) = 1 then
+    return case p_list -&gt; 0 -&gt;&gt; 'k'
+      when 'gone' then kk_msg(nm || ' har försvunnit',
+        nm || ' har inte öppnat Kilokampen på ' || d || ' dagar. Gå fram och säg det: logga in nu, coachen väntar. Ingen lämnas kvar.',
+        nm || ' has vanished',
+        nm || ' hasn’t opened Kilokampen in ' || d || ' days. Go and say it: sign in now, the coach is waiting. Nobody gets left behind.',
+        'Kayıp: ' || nm,
+        nm || ' ' || d || ' gündür Kilokampen’i açmadı. Git ve söyle: hemen giriş yapsın, koç bekliyor. Kimse geride kalmaz.')
+      when 'old' then kk_msg(nm || ' har tappat tråden',
+        nm || ' har inte varit inne på länge och kör en gammal version. Säg till: öppna appen nu. Coachen väntar, och tålamodet är slut.',
+        nm || ' has lost the thread',
+        nm || ' hasn’t been in for a long time and is on an old version. Tell them: open the app now. The coach is waiting, and patience has run out.',
+        'Geride kaldı: ' || nm,
+        nm || ' uzun zamandır girmedi, eski sürümü kullanıyor. Söyle: uygulamayı hemen açsın. Koç bekliyor, sabır tükendi.')
+      when 'nopush' then kk_msg(nm || ' hör mig inte',
+        nm || ' har inga notiser på. Jag kan inte coacha någon som inte hör mig. Säg till: slå på notiserna under Mer. I dag.',
+        nm || ' can’t hear me',
+        nm || ' has notifications off. I can’t coach someone who can’t hear me. Tell them: turn notifications on under More. Today.',
+        'Beni duymuyor: ' || nm,
+        nm || ' bildirimleri kapalı. Beni duymayan birine koçluk yapamam. Söyle: Diğer sayfasından bildirimleri açsın. Bugün.')
+      else kk_msg(nm || ' sitter fast i webbläsaren',
+        nm || ' har inte installerat appen. Säg till: lägg den på hemskärmen under Mer. Det tar en minut. Ursäkter tar längre.',
+        nm || ' is stuck in the browser',
+        nm || ' hasn’t installed the app. Tell them: put it on the home screen under More. It takes a minute. Excuses take longer.',
+        'Hâlâ tarayıcıda: ' || nm,
+        nm || ' uygulamayı yüklemedi. Söyle: Diğer sayfasından ana ekrana eklesin. Bir dakika sürer. Bahaneler daha uzun.')
+    end;
+  end if;
+  select string_agg(x -&gt;&gt; 'name' || ': ' || case x -&gt;&gt; 'k' when 'gone' then 'logga in, jag väntar' when 'old' then 'öppna appen, jag väntar'
+           when 'nopush' then 'slå på notiserna' else 'installera appen' end, '. ' order by i),
+         string_agg(x -&gt;&gt; 'name' || ': ' || case x -&gt;&gt; 'k' when 'gone' then 'sign in, I’m waiting' when 'old' then 'open the app, I’m waiting'
+           when 'nopush' then 'turn notifications on' else 'install the app' end, '. ' order by i),
+         string_agg(x -&gt;&gt; 'name' || ': ' || case x -&gt;&gt; 'k' when 'gone' then 'giriş yap, bekliyorum' when 'old' then 'uygulamayı aç, bekliyorum'
+           when 'nopush' then 'bildirimleri aç' else 'uygulamayı yükle' end, '. ' order by i)
+    into sv, en, tr from jsonb_array_elements(p_list) with ordinality t(x, i) where i &lt;= 4;
+  return kk_msg('Coachen behöver din hjälp', 'Säg till dem i dag. ' || sv || '. Ingen lämnas kvar.',
+    'The coach needs your help', 'Tell them today. ' || en || '. Nobody gets left behind.',
+    'Koç senden yardım istiyor', 'Bugün söyle. ' || tr || '. Kimse geride kalmaz.');
+end $$;
+
+-- Weekdays 08:30 UTC (09:30 or 10:30 in Sweden, when colleagues meet): everyone with notifications on gets one message
+-- naming the others the coach needs help with (at most four, never themselves). A person is named at most every other
+-- day (kk_fast_sent kind 'help', stored under the person named), so running it twice the same day sends nothing new.
+create or replace function kk_help_tick(p_now timestamptz default now()) returns int
+language plpgsql security definer set search_path = public as $$
+declare g kk_groups; r kk_members; list jsonb; mine jsonb; d date := (p_now at time zone 'Europe/Stockholm')::date; n int := 0;
+begin
+  for g in select * from kk_groups order by created_at loop
+    select coalesce(jsonb_agg(x order by i), '[]'::jsonb) into list
+      from (select x, i from jsonb_array_elements(kk_help(g.id, p_now)) with ordinality t(x, i)
+             where not exists (select 1 from kk_fast_sent s where s.member_id = (x -&gt;&gt; 'id')::uuid and s.kind = 'help' and s.day &gt;= d - 1)
+             order by i limit 4) y;
+    continue when jsonb_array_length(list) = 0;
+    for r in select * from kk_members m where m.group_id = g.id and exists (select 1 from kk_push_subs s where s.member_id = m.id)
+             order by m.created_at loop
+      select coalesce(jsonb_agg(x order by i), '[]'::jsonb) into mine
+        from jsonb_array_elements(list) with ordinality t(x, i) where x -&gt;&gt; 'id' &lt;&gt; r.id::text;
+      continue when jsonb_array_length(mine) = 0;
+      perform kk_push_i18n(array[r.id], kk_help_msg(mine), 'mer', 'coach-help');
+      n := n + 1;
+    end loop;
+    insert into kk_fast_sent (member_id, day, kind) select (x -&gt;&gt; 'id')::uuid, d, 'help' from jsonb_array_elements(list) x
+      on conflict do nothing;
+  end loop;
+  return n;
+end $$;
+revoke all on function kk_help(uuid, timestamptz), kk_help_msg(jsonb), kk_help_tick(timestamptz) from public, anon, authenticated;
+
 revoke all on function kk_day(timestamptz), kk_stop_at(date, int), kk_hhmm(int), kk_fast_answer_at(uuid, text, timestamptz),
   kk_fast_ate_at(uuid, timestamptz), kk_fast_tick(timestamptz), kk_fast_answer_code(uuid, text, timestamptz) from public, anon, authenticated;
 grant execute on function kk_fast_answer_code(uuid, text, timestamptz) to service_role;
@@ -1401,6 +1507,8 @@ begin
     perform cron.schedule('kk-fast-coach', '*/5 * * * *', 'select public.kk_fast_tick()');
     -- Every afternoon 15:00 UTC (16:00 or 17:00 in Sweden): the coach's one follow-up per person (kk_watch).
     perform cron.schedule('kk-coach-watch', '0 15 * * *', 'select public.kk_watch_tick()');
+    -- Weekdays 08:30 UTC (09:30 or 10:30 in Sweden): the coach asks the group to help with whoever is missing (kk_help).
+    perform cron.schedule('kk-coach-help', '30 8 * * 1-5', 'select public.kk_help_tick()');
   end if;
 end $$;
 
