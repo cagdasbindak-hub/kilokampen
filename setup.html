@@ -262,6 +262,7 @@ begin
         'id', m.id, 'name', m.name, 'emoji', m.emoji, 'color', m.color,
         'startKg', m.start_kg::float8, 'goalKg', m.goal_kg::float8, 'joined', m.joined, 'stepGoal', m.step_goal,
         'fastOn', m.fast_on, 'fastGoal', m.fast_goal, 'lang', m.lang, 'version', m.app_version, 'seen', m.app_seen, 'app', m.app_installed,
+        'appSince', m.app_since, 'push', exists (select 1 from kk_push_subs s where s.member_id = m.id),
         'fastYes', (select count(*) from kk_fast_days d where d.member_id = m.id and d.result = 'yes')) order by m.created_at), '[]'::json)
       from kk_members m where m.group_id = g.id),
     'weighIns', (select coalesce(json_agg(json_build_object(
@@ -1340,10 +1341,14 @@ revoke all on function kk_watch(uuid, timestamptz, boolean), kk_watch_msg(jsonb)
 
 -- ---------- app version (owner 2026-11-12) ----------
 -- Which version of the app each person opened last, when, and whether from the installed app or a browser tab, so the
--- group owner can see who still runs an old version or has not installed the app.
+-- group sees who still runs an old version, has not installed the app or has no notifications (kk_state: 'push').
 alter table kk_members add column if not exists app_version int;
 alter table kk_members add column if not exists app_seen timestamptz;
 alter table kk_members add column if not exists app_installed boolean;
+-- The first time this person opened the installed app (owner 2026-11-12: everyone sees who has the app). Unlike
+-- app_installed it stays when the same person later opens a browser tab. Filled once from the visits before it existed.
+alter table kk_members add column if not exists app_since timestamptz;
+update kk_members set app_since = app_seen where app_installed and app_since is null;
 
 -- Sent once each time the app is opened. (The first version had no p_app; it is replaced, not kept beside.)
 drop function if exists kk_seen(uuid, int);
@@ -1353,7 +1358,8 @@ declare me kk_members;
 begin
   me := kk_me(p_token);
   if p_version is null or p_version &lt; 1 or p_version &gt; 1000000 then raise exception 'bad_text'; end if;
-  update kk_members set app_version = p_version, app_seen = now(), app_installed = coalesce(p_app, app_installed) where id = me.id;
+  update kk_members set app_version = p_version, app_seen = now(), app_installed = coalesce(p_app, app_installed),
+    app_since = case when p_app then coalesce(app_since, now()) else app_since end where id = me.id;
   return json_build_object('ok', true);
 end $$;
 grant execute on function kk_seen(uuid, int, boolean) to anon, authenticated;
