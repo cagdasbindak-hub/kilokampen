@@ -261,7 +261,7 @@ begin
     'members', (select coalesce(json_agg(json_build_object(
         'id', m.id, 'name', m.name, 'emoji', m.emoji, 'color', m.color,
         'startKg', m.start_kg::float8, 'goalKg', m.goal_kg::float8, 'joined', m.joined, 'stepGoal', m.step_goal,
-        'fastOn', m.fast_on, 'fastGoal', m.fast_goal, 'lang', m.lang,
+        'fastOn', m.fast_on, 'fastGoal', m.fast_goal, 'lang', m.lang, 'version', m.app_version, 'seen', m.app_seen,
         'fastYes', (select count(*) from kk_fast_days d where d.member_id = m.id and d.result = 'yes')) order by m.created_at), '[]'::json)
       from kk_members m where m.group_id = g.id),
     'weighIns', (select coalesce(json_agg(json_build_object(
@@ -1218,6 +1218,23 @@ begin
   update kk_members set lang = p_lang where id = me.id;
   return kk_state(p_token);
 end $$;
+
+-- ---------- app version (owner 2026-11-12) ----------
+-- Which version of the app each person opened last and when, so the group owner can see who still runs an old one.
+alter table kk_members add column if not exists app_version int;
+alter table kk_members add column if not exists app_seen timestamptz;
+
+-- Sent once each time the app is opened.
+create or replace function kk_seen(p_token uuid, p_version int) returns json
+language plpgsql security definer set search_path = public as $$
+declare me kk_members;
+begin
+  me := kk_me(p_token);
+  if p_version is null or p_version &lt; 1 or p_version &gt; 1000000 then raise exception 'bad_text'; end if;
+  update kk_members set app_version = p_version, app_seen = now() where id = me.id;
+  return json_build_object('ok', true);
+end $$;
+grant execute on function kk_seen(uuid, int) to anon, authenticated;
 
 revoke all on function kk_day(timestamptz), kk_stop_at(date, int), kk_hhmm(int), kk_fast_answer_at(uuid, text, timestamptz),
   kk_fast_ate_at(uuid, timestamptz), kk_fast_tick(timestamptz), kk_fast_answer_code(uuid, text, timestamptz) from public, anon, authenticated;
