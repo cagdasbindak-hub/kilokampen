@@ -402,6 +402,7 @@ begin
   delete from kk_checks where member_id = me.id and challenge_id = p_challenge and date = p_date;
   if not found then
     insert into kk_checks (member_id, challenge_id, date) values (me.id, p_challenge, p_date);
+    perform kk_full_week(me.id, p_challenge, p_date);
   end if;
   return kk_state(p_token);
 end $$;
@@ -1544,6 +1545,31 @@ begin
   return kk_state(p_token);
 end $$;
 grant execute on function kk_vote_challenge(uuid, text, text, text) to anon, authenticated;
+
+-- Seven out of seven (owner 2026-11-12: "klarar de en vecka i rad, gör något fint för dem"): a challenge ticked on every
+-- day of a Monday–Sunday week. The app celebrates and gives points and a badge (fullWeeks in src/logic.ts, same rule);
+-- here the rest of the group is told, once per person and week (kk_fast_sent kind 'full7' under the week's Monday), so
+-- unticking and ticking again, or a second full challenge the same week, sends nothing new. Never blocks the tick.
+create or replace function kk_full_week(p_member uuid, p_challenge text, p_date date) returns void
+language plpgsql security definer set search_path = public as $$
+declare m kk_members; g kk_groups; w date := date_trunc('week', p_date)::date; c uuid;
+begin
+  if (select count(distinct date) from kk_checks where member_id = p_member and challenge_id = p_challenge
+      and date between w and w + 6) &lt; 7 then return; end if;
+  select * into m from kk_members where id = p_member;
+  select * into g from kk_groups where id = m.group_id;
+  if g.end_date is not null and g.end_date &lt; current_date then return; end if;
+  insert into kk_fast_sent (member_id, day, kind) values (p_member, w, 'full7') on conflict do nothing returning code into c;
+  if c is null then return; end if;
+  perform kk_push_i18n(kk_others(p_member), kk_msg(
+    '💯 ' || m.name || ': sju av sju!', m.name || ' klarade en utmaning varje dag hela veckan. Skicka en hejning.',
+    '💯 ' || m.name || ': seven out of seven!', m.name || ' did a challenge every day for a whole week. Send a cheer.',
+    '💯 ' || m.name || ': yediye yedi!', m.name || ' bir görevi bütün hafta her gün yaptı. Bir alkış gönder.'),
+    'topplista', 'full7-' || p_member);
+exception when others then
+  null;
+end $$;
+revoke all on function kk_full_week(uuid, text, date) from public, anon, authenticated;
 
 -- ---------- who may call what ----------
 revoke all on function kk_hash(text, text), kk_new_code(), kk_me(uuid), kk_check_person(text, text, numeric, numeric), kk_challenges(),
