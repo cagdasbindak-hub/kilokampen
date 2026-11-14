@@ -853,11 +853,12 @@ declare sender text;
 begin
   select name into sender from kk_members where id = new.from_id;
   if new.kind = 'poke' then
-    perform kk_push_i18n(array[new.to_id], kk_msg(sender || ' påminner dig', 'Dags att väga in den här veckan ⏰',
-      sender || ' is reminding you', 'Time to weigh in this week ⏰', sender || ' sana hatırlatıyor', 'Bu hafta tartılma zamanı ⏰'), 'hem', 'poke');
+    perform kk_push_i18n(array[new.to_id], kk_msg(sender || ' väntar på din vikt ⏰', 'Alla andra kan ställa sig på vågen. Det kan du också. Nu.',
+      sender || ' is waiting for your weight ⏰', 'Everyone else can step on the scale. So can you. Now.',
+      sender || ' kilonu bekliyor ⏰', 'Herkes tartıya çıkabiliyor. Sen de çıkabilirsin. Şimdi.'), 'hem', 'poke');
   else
-    perform kk_push_i18n(array[new.to_id], kk_msg(sender || ' hejar på dig! 📣', 'Kämpa på, du gör det bra.',
-      sender || ' is cheering for you! 📣', 'Keep going, you are doing well.', sender || ' seni alkışlıyor! 📣', 'Devam et, çok iyi gidiyorsun.'), 'hem', 'cheer');
+    perform kk_push_i18n(array[new.to_id], kk_msg(sender || ' hejar på dig 📣', 'Någon tror på dig. Nu levererar du.',
+      sender || ' is cheering for you 📣', 'Someone believes in you. Now deliver.', sender || ' seni alkışlıyor 📣', 'Biri sana inanıyor. Şimdi sıra sende.'), 'hem', 'cheer');
   end if;
   return new;
 exception when others then
@@ -900,8 +901,8 @@ end $$;
 create or replace function kk_on_member() returns trigger
 language plpgsql security definer set search_path = public as $$
 begin
-  perform kk_push_i18n(kk_others(new.id), kk_msg(new.name || ' har gått med 👋', 'Välkomna med ett hejarop!',
-    new.name || ' has joined 👋', 'Welcome them with a cheer!', new.name || ' gruba katıldı 👋', 'Bir alkışla karşılayın!'), 'topplista', 'join-' || new.id);
+  perform kk_push_i18n(kk_others(new.id), kk_msg(new.name || ' har gått med 👋', 'En konkurrent till. Heja på, och visa vem som leder.',
+    new.name || ' has joined 👋', 'One more rival. Cheer, and show who leads.', new.name || ' gruba katıldı 👋', 'Bir rakip daha. Alkışla ve kimin önde olduğunu göster.'), 'topplista', 'join-' || new.id);
   return new;
 exception when others then
   return new;
@@ -1012,9 +1013,9 @@ declare who uuid[]; monday date := date_trunc('week', (now() at time zone 'Europ
 begin
   select array_agg(m.id) into who from kk_members m
   where not exists (select 1 from kk_weigh_ins w where w.member_id = m.id and w.date &gt;= monday);
-  perform kk_push_i18n(who, kk_msg('Veckans vikt saknas', 'Ställ dig på vågen och fyll i. Det tar tio sekunder.',
-    'This week’s weight is missing', 'Step on the scale and fill it in. It takes ten seconds.',
-    'Bu haftanın kilosu eksik', 'Tartıya çık ve gir. On saniye sürer.'), 'hem', 'weigh');
+  perform kk_push_i18n(who, kk_msg('Ingen vikt den här veckan', 'Söndag och ingen vikt. Ursäkter har aldrig vunnit en vecka. Upp på vågen nu, tio sekunder.',
+    'No weight this week', 'Sunday and no weight. Excuses never won a week. Get on the scale now, ten seconds.',
+    'Bu hafta kilo yok', 'Pazar ve kilo yok. Bahaneler hafta kazandırmaz. Şimdi tartıya çık, on saniye.'), 'hem', 'weigh');
 end $$;
 
 -- ---------- the coach: Kvällsstopp (owner 2026-11-11) ----------
