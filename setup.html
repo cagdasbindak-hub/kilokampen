@@ -108,6 +108,16 @@ alter table kk_members add column if not exists kg_milestone int not null defaul
 alter table kk_members add column if not exists goal_told boolean not null default false;
 alter table kk_steps enable row level security;
 revoke all on kk_steps from anon, authenticated;
+-- Training days (suggested by a member 2026-11-16): which days a person trained, and what kind of training.
+create table if not exists kk_workouts (
+  member_id uuid not null references kk_members(id) on delete cascade,
+  date date not null,
+  kind text not null,
+  created_at timestamptz not null default now(),
+  primary key (member_id, date, kind)
+);
+alter table kk_workouts enable row level security;
+revoke all on kk_workouts from anon, authenticated;
 -- The coach's Kvällsstopp (owner 2026-11-11): a last time to eat each evening, in minutes after midnight (Swedish time).
 alter table kk_members add column if not exists fast_on boolean not null default false;
 alter table kk_members add column if not exists fast_goal int not null default 1320;
@@ -283,6 +293,8 @@ begin
       from kk_cheers c join kk_members m on m.id = c.to_id where m.group_id = g.id),
     'steps', (select coalesce(json_agg(json_build_object('memberId', st.member_id, 'date', st.date, 'steps', st.steps)), '[]'::json)
       from kk_steps st join kk_members m on m.id = st.member_id where m.group_id = g.id and st.date &gt;= current_date - 60),
+    'workouts', (select coalesce(json_agg(json_build_object('memberId', wo.member_id, 'date', wo.date, 'kind', wo.kind)), '[]'::json)
+      from kk_workouts wo join kk_members m on m.id = wo.member_id where m.group_id = g.id),
     'winners', (select coalesce(json_agg(json_build_object('weekStart', x.week_start, 'memberId', x.member_id, 'name', x.name,
         'pct', x.pct::float8, 'kg', x.kg::float8) order by x.week_start desc), '[]'::json)
       from (select * from kk_week_winners where group_id = g.id and name is not null order by week_start desc limit 26) x),
@@ -429,6 +441,36 @@ begin
   me := kk_me(p_token);
   if not exists (select 1 from kk_groups where id = me.group_id and owner_id = me.id) then raise exception 'not_owner'; end if;
   update kk_groups set name = case when length(gname) &gt; 0 then gname else name end, end_date = p_end_date where id = me.group_id;
+  return kk_state(p_token);
+end $$;
+
+-- Training days (suggested by a member 2026-11-16): tick the days you trained and what you did. The same list as
+-- WORKOUTS in src/logic.ts. Ticking again takes it away. The first tick of a day is told to the rest of the group, once.
+create or replace function kk_workout_kinds() returns text[]
+language sql immutable as $$ select array['gym','run','swim','pingis','bike','ball','walk','other'] $$;
+
+create or replace function kk_toggle_workout(p_token uuid, p_kind text, p_date date) returns json
+language plpgsql security definer set search_path = public as $$
+declare me kk_members; n int;
+begin
+  me := kk_me(p_token);
+  if p_kind is null or not (p_kind = any (kk_workout_kinds())) then raise exception 'bad_kind'; end if;
+  if p_date is null or p_date &gt; current_date + 1 or p_date &lt; current_date - 14 then raise exception 'bad_date'; end if;
+  delete from kk_workouts where member_id = me.id and date = p_date and kind = p_kind;
+  if not found then
+    insert into kk_workouts (member_id, date, kind) values (me.id, p_date, p_kind);
+    if p_date &gt;= current_date - 1
+       and not exists (select 1 from kk_groups where id = me.group_id and end_date is not null and end_date &lt; current_date) then
+      insert into kk_fast_sent (member_id, day, kind) values (me.id, p_date, 'workout') on conflict do nothing;
+      get diagnostics n = row_count;
+      if n = 1 then
+        perform kk_push_i18n(kk_others(me.id), kk_msg(
+          me.name || ' har tränat 💪', 'Ett pass avklarat. Vad har du gjort?',
+          me.name || ' has trained 💪', 'One session done. What have you done?',
+          me.name || ' antrenman yaptı 💪', 'Bir antrenman tamam. Sen ne yaptın?'), 'utmaningar', 'workout-' || me.id);
+      end if;
+    end if;
+  end if;
   return kk_state(p_token);
 end $$;
 
@@ -1593,7 +1635,7 @@ end $$;
 revoke all on function kk_full_week(uuid, text, date) from public, anon, authenticated;
 
 -- ---------- who may call what ----------
-revoke all on function kk_hash(text, text), kk_new_code(), kk_me(uuid), kk_check_person(text, text, numeric, numeric), kk_challenges(),
+revoke all on function kk_hash(text, text), kk_new_code(), kk_me(uuid), kk_check_person(text, text, numeric, numeric), kk_challenges(), kk_workout_kinds(),
   kk_add_member(uuid, text, text, text, numeric, numeric, jsonb, jsonb), kk_open_session(uuid) from public, anon, authenticated;
 grant usage on schema public to anon, authenticated;
 grant execute on function
@@ -1601,7 +1643,7 @@ grant execute on function
   kk_join(text, text, text, text, numeric, numeric, jsonb, jsonb), kk_login(text, text, text), kk_logout(uuid),
   kk_weigh_in(uuid, date, numeric), kk_remove_weigh_in(uuid, uuid), kk_update_me(uuid, numeric),
   kk_toggle_check(uuid, text, date), kk_cheer(uuid, uuid, text, date), kk_set_settings(uuid, text, date), kk_leave(uuid),
-  kk_set_steps(uuid, date, integer), kk_set_step_goal(uuid, integer),
+  kk_set_steps(uuid, date, integer), kk_set_step_goal(uuid, integer), kk_toggle_workout(uuid, text, date),
   kk_change_pin(uuid, text, text), kk_owner_reset_pin(uuid, uuid, text), kk_owner_remove(uuid, uuid)
   to anon, authenticated;
 
