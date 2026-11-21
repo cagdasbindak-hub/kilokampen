@@ -1186,7 +1186,7 @@ begin
           else kk_msg('God morgon', 'Klarade du gårdagens kvällsstopp kl ' || g || '?',
             'Good morning', 'Did you keep yesterday’s evening stop at ' || g || '?',
             'Günaydın', 'Dün akşamki saat ' || g || ' sınırını tuttun mu?') end,
-          'coach', 'fast-ask', jsonb_build_object('actions', kk_yes_no(), 'answer', c));
+          'fasta', 'fast-ask', jsonb_build_object('actions', kk_yes_no(), 'answer', c));
       end if;
     elsif open and mins between 720 and 1260 then
       insert into kk_fast_sent (member_id, day, kind) values (m.id, l, 'nag') on conflict do nothing returning code into c;
@@ -1207,7 +1207,7 @@ begin
           else kk_msg('Glömde du?', 'Svara gärna om gårdagens kvällsstopp kl ' || g || '.',
             'Forgot?', 'Please answer about yesterday’s evening stop at ' || g || '.',
             'Unuttun mu?', 'Dün akşamki saat ' || g || ' sınırı için cevap ver lütfen.') end,
-          'coach', 'fast-ask', jsonb_build_object('actions', kk_yes_no(), 'answer', c));
+          'fasta', 'fast-ask', jsonb_build_object('actions', kk_yes_no(), 'answer', c));
       end if;
     end if;
     if mins &gt;= m.fast_goal - 30 and mins &lt; m.fast_goal then
@@ -1229,7 +1229,7 @@ begin
           else kk_msg('Snart kvällsstopp', 'Ditt kvällsstopp är kl ' || g || '. 30 minuter kvar.',
             'Evening stop soon', 'Your evening stop is at ' || g || '. 30 minutes left.',
             'Akşam sınırı yaklaşıyor', 'Akşam sınırın saat ' || g || '. 30 dakika kaldı.') end,
-          'coach', 'fast-warn');
+          'fasta', 'fast-warn');
       end if;
     end if;
   end loop;
@@ -1411,9 +1411,9 @@ begin
     continue when jsonb_array_length(w) = 0;
     insert into kk_fast_sent (member_id, day, kind) values (m.id, d, 'watch') on conflict do nothing returning code into c;
     continue when c is null;
-    -- Challenge reminders open the challenges, everything else the coach.
+    -- Challenge reminders open the challenges, eating (evening stop) the fasting page, everything else the coach.
     perform kk_push_i18n(array[m.id], kk_watch_msg(w -&gt; 0),
-      case when w -&gt; 0 -&gt;&gt; 'k' in ('challenge', 'chno', 'chfav') then 'utmaningar' else 'coach' end, 'coach-watch');
+      case when w -&gt; 0 -&gt;&gt; 'k' in ('challenge', 'chno', 'chfav') then 'utmaningar' when w -&gt; 0 -&gt;&gt; 'k' in ('eat', 'nostop') then 'fasta' else 'coach' end, 'coach-watch');
     n := n + 1;
   end loop;
   return n;
