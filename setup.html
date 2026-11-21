@@ -370,6 +370,13 @@ begin
   return json_build_object('ok', true);
 end $$;
 
+-- The start weigh-in is locked after the first week (owner 2026-11-20: "ingångsvikten inte går att ändra efter första
+-- veckan"): from seven days after the start day, nothing on or before the start day can be written or removed. The start
+-- weight itself (kk_members.start_kg, what every result counts from) has never been changeable. Same rule as startLocked
+-- in src/logic.ts.
+create or replace function kk_start_locked(p_member kk_members, p_date date) returns boolean
+language sql stable as $$ select p_date &lt;= p_member.joined and current_date &gt;= p_member.joined + 7 $$;
+
 create or replace function kk_weigh_in(p_token uuid, p_date date, p_kg numeric) returns json
 language plpgsql security definer set search_path = public as $$
 declare me kk_members;
@@ -377,6 +384,7 @@ begin
   me := kk_me(p_token);
   if p_kg is null or p_kg &lt; 40 or p_kg &gt; 300 then raise exception 'bad_weight'; end if;
   if p_date is null or p_date &gt; current_date + 1 or p_date &lt; current_date - 3650 then raise exception 'bad_date'; end if;
+  if kk_start_locked(me, p_date) then raise exception 'start_locked'; end if;
   insert into kk_weigh_ins (member_id, date, kg) values (me.id, p_date, round(p_kg, 1))
   on conflict (member_id, date) do update set kg = excluded.kg;
   perform kk_celebrate(me.id);
@@ -388,6 +396,7 @@ language plpgsql security definer set search_path = public as $$
 declare me kk_members;
 begin
   me := kk_me(p_token);
+  if kk_start_locked(me, (select date from kk_weigh_ins where id = p_id and member_id = me.id)) then raise exception 'start_locked'; end if;
   if (select count(*) from kk_weigh_ins where member_id = me.id) &gt; 1 then
     delete from kk_weigh_ins where id = p_id and member_id = me.id;
   end if;
@@ -1635,7 +1644,7 @@ end $$;
 revoke all on function kk_full_week(uuid, text, date) from public, anon, authenticated;
 
 -- ---------- who may call what ----------
-revoke all on function kk_hash(text, text), kk_new_code(), kk_me(uuid), kk_check_person(text, text, numeric, numeric), kk_challenges(), kk_workout_kinds(),
+revoke all on function kk_hash(text, text), kk_new_code(), kk_me(uuid), kk_start_locked(kk_members, date), kk_check_person(text, text, numeric, numeric), kk_challenges(), kk_workout_kinds(),
   kk_add_member(uuid, text, text, text, numeric, numeric, jsonb, jsonb), kk_open_session(uuid) from public, anon, authenticated;
 grant usage on schema public to anon, authenticated;
 grant execute on function
