@@ -1071,7 +1071,9 @@ end $$;
 
 -- ---------- the coach: Kvällsstopp (owner 2026-11-11) ----------
 -- Each evening has a stop time; after it the person eats nothing until they wake up. Every morning the coach asks about
--- the evening before: yes moves the time 20 minutes earlier (never before 19:00), no keeps it. Hard words by default
+-- the evening before. The person picks the time themselves and the coach never moves it (owner 2026-11-24: "lägga inga
+-- gränser … man kan sätta sitt mål när man vill äta senast"): any minute from 04:00 (240) to 03:59 the next night (1679),
+-- since the day rolls over at 04:00; 00:30 is stored as 1470. Hard words by default
 -- (the group's theme: "hård coach"), soft if the person chooses. A day rolls over at 04:00 Swedish time, so a late
 -- evening still belongs to the day it started. Same rules as fastView, answerFast and ateFast in src/logic.ts.
 create or replace function kk_day(p_at timestamptz default now()) returns date
@@ -1082,25 +1084,25 @@ create or replace function kk_stop_at(p_day date, p_mins int) returns timestampt
 language sql stable set search_path = public as $$ select (p_day::timestamp + make_interval(mins =&gt; p_mins)) at time zone 'Europe/Stockholm' $$;
 
 create or replace function kk_hhmm(p_mins int) returns text
-language sql immutable as $$ select lpad((p_mins / 60)::text, 2, '0') || ':' || lpad((p_mins % 60)::text, 2, '0') $$;
+language sql immutable as $$ select lpad((p_mins % 1440 / 60)::text, 2, '0') || ':' || lpad((p_mins % 60)::text, 2, '0') $$;
 
--- Turn on (or start again with a new time), change the tone, or turn off. Starting makes today the first evening.
+-- Turn on, change the time, change the tone, or turn off. Turning on makes today the first evening; a new time keeps the history.
 create or replace function kk_fast_set(p_token uuid, p_on boolean, p_goal int, p_tone text) returns json
 language plpgsql security definer set search_path = public as $$
 declare me kk_members; restart boolean;
 begin
   me := kk_me(p_token);
   if p_on is null or p_tone is null or p_tone not in ('hard', 'soft') then raise exception 'bad_text'; end if;
-  if p_goal is null or p_goal &lt; 1140 or p_goal &gt; 1410 or p_goal % 5 &lt;&gt; 0 then raise exception 'bad_date'; end if;
-  restart := p_on and (not me.fast_on or me.fast_goal &lt;&gt; p_goal);
+  if p_goal is null or p_goal &lt; 240 or p_goal &gt; 1679 then raise exception 'bad_date'; end if;
+  restart := p_on and not me.fast_on;
   update kk_members set fast_on = p_on, fast_tone = p_tone,
-    fast_goal = case when restart then p_goal else fast_goal end,
+    fast_goal = case when p_on then p_goal else fast_goal end,
     fast_since = case when restart then kk_day() else fast_since end
   where id = me.id;
   return kk_state(p_token);
 end $$;
 
--- The morning answer about last evening, once. Yes: 20 minutes earlier, never before 19:00. No: the same time again.
+-- The morning answer about last evening, once. The time stays the person's own either way.
 create or replace function kk_fast_answer_at(p_member uuid, p_result text, p_now timestamptz) returns void
 language plpgsql security definer set search_path = public as $$
 declare me kk_members; d date := kk_day(p_now) - 1;
@@ -1111,7 +1113,6 @@ begin
   if exists (select 1 from kk_fast_days where member_id = me.id and day = d and result is not null) then raise exception 'bad_date'; end if;
   insert into kk_fast_days (member_id, day, goal, result, answered_at) values (me.id, d, me.fast_goal, p_result, p_now)
   on conflict (member_id, day) do update set result = excluded.result, answered_at = excluded.answered_at;
-  if p_result = 'yes' then update kk_members set fast_goal = greatest(1140, fast_goal - 20) where id = me.id; end if;
 end $$;
 create or replace function kk_fast_answer(p_token uuid, p_result text) returns json
 language plpgsql security definer set search_path = public as $$
@@ -1157,6 +1158,8 @@ declare
   l date := kk_day(p_now);
   t timestamp := p_now at time zone 'Europe/Stockholm';
   mins int := extract(hour from t)::int * 60 + extract(minute from t)::int;
+  -- minutes since midnight of the coach's day, so a stop after midnight (stored as 1440+) is still found
+  lm int := floor(extract(epoch from t - l::timestamp) / 60)::int;
   i int := 1 + extract(doy from l)::int % 3;
   m kk_members; open boolean; hard boolean; g text; c uuid;
 begin
@@ -1210,7 +1213,7 @@ begin
           'fasta', 'fast-ask', jsonb_build_object('actions', kk_yes_no(), 'answer', c));
       end if;
     end if;
-    if mins &gt;= m.fast_goal - 30 and mins &lt; m.fast_goal then
+    if lm &gt;= m.fast_goal - 30 and lm &lt; m.fast_goal then
       insert into kk_fast_sent (member_id, day, kind) values (m.id, l, 'warn') on conflict do nothing returning code into c;
       if c is not null then
         perform kk_push_i18n(array[m.id], case when hard then kk_msg(
@@ -1261,14 +1264,10 @@ begin
       when 'en' then case when hard then 'Weak, but honest. Same time tonight: ' || g || '. Do it again, do it right.' else 'It happens. Same time tonight: ' || g || '. You can do it.' end
       when 'tr' then case when hard then 'Zayıf ama dürüst. Bu akşam aynı saat: ' || g || '. Tekrar yap, doğru yap.' else 'Olur böyle şeyler. Bu akşam aynı saat: ' || g || '. Başarabilirsin.' end
       else case when hard then 'Svagt, men ärligt. Samma tid i kväll: ' || g || '. Gör om, gör rätt.' else 'Det händer. Samma tid i kväll: ' || g || '. Du klarar det.' end end
-    when me.fast_goal = 1140 then case me.lang
-      when 'en' then case when hard then g || ' is the floor. Hold it, every evening.' else 'You have reached ' || g || '. Hold it!' end
-      when 'tr' then case when hard then g || ' taban. Her akşam koru.' else g || ' saatine ulaştın. Koru!' end
-      else case when hard then g || ' är golvet. Håll det, varje kväll.' else 'Du har nått ' || g || '. Håll det!' end end
     else case me.lang
-      when 'en' then case when hard then 'Good. Tonight: ' || g || '. No rest.' else 'Well done! Tonight: ' || g || '.' end
-      when 'tr' then case when hard then 'Güzel. Bu akşam: ' || g || '. Dinlenmek yok.' else 'Harika iş! Bu akşam: ' || g || '.' end
-      else case when hard then 'Bra. I kväll: ' || g || '. Ingen vila.' else 'Snyggt jobbat! I kväll: ' || g || '.' end end
+      when 'en' then case when hard then 'Good. Same time tonight: ' || g || '. No rest.' else 'Well done! Tonight: ' || g || '.' end
+      when 'tr' then case when hard then 'Güzel. Bu akşam aynı saat: ' || g || '. Dinlenmek yok.' else 'Harika iş! Bu akşam: ' || g || '.' end
+      else case when hard then 'Bra. Samma tid i kväll: ' || g || '. Ingen vila.' else 'Snyggt jobbat! I kväll: ' || g || '.' end end
   end;
   return json_build_object('title', title, 'body', body);
 end $$;
