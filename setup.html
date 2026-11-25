@@ -1288,7 +1288,9 @@ end $$;
 -- anyone's body. Items: quiet (app not opened for 3+ days), weigh (no weigh-in this week, from Thursday), eat (ate after
 -- the evening stop on 2 of the last 3 evenings), steps (written steps under 80 % of the goal), nosteps (stopped writing
 -- steps), move (never writes steps), challenge (nothing ticked for 3 days; chno instead when the person also said "not for
--- me" to 3+ challenges in the last week; chfav when favourites from 3+ days ago got no tick for 3 days), nostop (no evening stop).
+-- me" to 3+ challenges in the last week; chfav when favourites from 3+ days ago got no tick for 3 days; habit first, when a
+-- challenge done 5+ times and on 3+ of the seven days before the last three got no tick in the last three, owner 2026-11-25:
+-- "så den blir en vana", same rule as the app's habit steps in src/logic.ts), nostop (no evening stop).
 -- p_notify: for the daily notification some reminders only come on certain weekdays, so nobody gets the same one every
 -- day; the app (p_notify false) shows everything that is true now.
 create or replace function kk_watch(p_member uuid, p_now timestamptz default now(), p_notify boolean default false) returns jsonb
@@ -1299,6 +1301,7 @@ declare
   l date := kk_day(p_now);
   dow int := extract(isodow from (p_now at time zone 'Europe/Stockholm'))::int;
   r jsonb := '[]'::jsonb; nos int; logged int; avg_steps int; seen date; said_no int; ticked boolean;
+  hab_id text; hab_n int;
 begin
   select * into m from kk_members where id = p_member;
   -- Peace on the day someone joins, and nothing after the end of the competition.
@@ -1331,7 +1334,18 @@ begin
   end if;
   select count(*) into said_no from kk_challenge_votes v where v.member_id = m.id and v.vote = 'no' and v.at &gt; p_now - interval '7 days';
   ticked := exists (select 1 from kk_checks c where c.member_id = m.id and c.date between d - 2 and d);
-  if not ticked and said_no &gt;= 3 then
+  -- A habit on the way that stopped: the one done most often.
+  select c.challenge_id, count(distinct c.date) into hab_id, hab_n from kk_checks c
+    where c.member_id = m.id and c.date &lt;= d
+      and not exists (select 1 from kk_challenge_votes v where v.member_id = m.id and v.challenge_id = c.challenge_id and v.vote = 'no')
+    group by c.challenge_id
+    having count(distinct c.date) &gt;= 5
+       and count(distinct c.date) filter (where c.date between d - 9 and d - 3) &gt;= 3
+       and count(*) filter (where c.date between d - 2 and d) = 0
+    order by 2 desc, 1 limit 1;
+  if hab_id is not null then
+    r := r || jsonb_build_array(jsonb_build_object('k', 'habit', 'c', hab_id, 'n', hab_n));
+  elsif not ticked and said_no &gt;= 3 then
     r := r || jsonb_build_array(jsonb_build_object('k', 'chno', 'n', said_no));
   elsif exists (select 1 from kk_challenge_votes v where v.member_id = m.id and v.vote = 'yes' and v.at &lt;= p_now - interval '3 days')
     and not exists (select 1 from kk_checks c join kk_challenge_votes v on v.member_id = c.member_id and v.challenge_id = c.challenge_id
@@ -1389,6 +1403,10 @@ begin
       'Nej, nej, nej', 'Du har sagt nej till ' || n || ' utmaningar på en vecka och bockat noll. Det finns fler att välja på. Välj en och gör den. I dag.',
       'No, no, no', 'You said no to ' || n || ' challenges in a week and ticked none. There are more to choose from. Pick one and do it. Today.',
       'Hayır, hayır, hayır', 'Bir haftada ' || n || ' göreve hayır dedin ve hiçbirini işaretlemedin. Seçecek daha çok şey var. Birini seç ve yap. Bugün.')
+    when 'habit' then kk_msg(
+      'Släpp den inte', 'Du har gjort en utmaning ' || n || ' gånger, och nu tre dagar utan. Det är så vanor dör. Gör den i dag.',
+      'Don’t let go', 'You have done a challenge ' || n || ' times, and now three days without. That is how habits die. Do it today.',
+      'Bırakma', 'Bir görevi ' || n || ' kez yaptın, şimdi üç gündür yok. Alışkanlıklar böyle ölür. Bugün yap.')
     when 'chfav' then kk_msg(
       'Snack eller verkstad?', 'Intressant, sa du. Tre dagar utan en bock på dina favoriter. Ord är billiga. Gör en i dag.',
       'Talk or action?', 'Interesting, you said. Three days without a tick on your favourites. Words are cheap. Do one today.',
@@ -1412,7 +1430,7 @@ begin
     continue when c is null;
     -- Challenge reminders open the challenges, eating (evening stop) the fasting page, everything else the coach.
     perform kk_push_i18n(array[m.id], kk_watch_msg(w -&gt; 0),
-      case when w -&gt; 0 -&gt;&gt; 'k' in ('challenge', 'chno', 'chfav') then 'utmaningar' when w -&gt; 0 -&gt;&gt; 'k' in ('eat', 'nostop') then 'fasta' else 'coach' end, 'coach-watch');
+      case when w -&gt; 0 -&gt;&gt; 'k' in ('challenge', 'chno', 'chfav', 'habit') then 'utmaningar' when w -&gt; 0 -&gt;&gt; 'k' in ('eat', 'nostop') then 'fasta' else 'coach' end, 'coach-watch');
     n := n + 1;
   end loop;
   return n;
