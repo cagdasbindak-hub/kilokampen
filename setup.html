@@ -456,7 +456,7 @@ end $$;
 -- Training days (suggested by a member 2026-11-16): tick the days you trained and what you did. The same list as
 -- WORKOUTS in src/logic.ts. Ticking again takes it away. The first tick of a day is told to the rest of the group, once.
 create or replace function kk_workout_kinds() returns text[]
-language sql immutable as $$ select array['gym','run','swim','pingis','bike','ball','walk','other'] $$;
+language sql immutable as $$ select array['gym','run','swim','pingis','bike','ball','walk','other','taichi'] $$;
 
 create or replace function kk_toggle_workout(p_token uuid, p_kind text, p_date date) returns json
 language plpgsql security definer set search_path = public as $$
