@@ -292,16 +292,17 @@ begin
         'id', c.id, 'from', c.from_id, 'to', c.to_id, 'date', c.date, 'kind', c.kind) order by c.date), '[]'::json)
       from kk_cheers c join kk_members m on m.id = c.to_id where m.group_id = g.id),
     'steps', (select coalesce(json_agg(json_build_object('memberId', st.member_id, 'date', st.date, 'steps', st.steps)), '[]'::json)
-      from kk_steps st join kk_members m on m.id = st.member_id where m.group_id = g.id and st.date &gt;= current_date - 60),
+      from kk_steps st join kk_members m on m.id = st.member_id where m.group_id = g.id),
     'workouts', (select coalesce(json_agg(json_build_object('memberId', wo.member_id, 'date', wo.date, 'kind', wo.kind)), '[]'::json)
       from kk_workouts wo join kk_members m on m.id = wo.member_id where m.group_id = g.id),
     'winners', (select coalesce(json_agg(json_build_object('weekStart', x.week_start, 'memberId', x.member_id, 'name', x.name,
         'pct', x.pct::float8, 'kg', x.kg::float8) order by x.week_start desc), '[]'::json)
       from (select * from kk_week_winners where group_id = g.id and name is not null order by week_start desc limit 26) x),
-    -- Kvällsstopp: everyone's answers (the group sees them); the length of the night's fast only for me.
+    -- Kvällsstopp: everyone's answers (the group sees them); the length of the night's fast only for me. Steps and evenings
+    -- come from all history (2026-11-26): badges, points and the races count from the first day, not from a window.
     'fastDays', (select coalesce(json_agg(json_build_object('memberId', f.member_id, 'day', f.day, 'goal', f.goal, 'result', f.result,
         'fasted', case when f.member_id = me.id then f.fasted end) order by f.day), '[]'::json)
-      from kk_fast_days f join kk_members m on m.id = f.member_id where m.group_id = g.id and f.day &gt;= kk_day() - 35),
+      from kk_fast_days f join kk_members m on m.id = f.member_id where m.group_id = g.id),
     'fast', json_build_object('since', me.fast_since, 'tone', me.fast_tone, 'end', me.fast_end),
     -- What the coach sees for each person in the group today (the group sees it all, like everything else).
     'watch', (select coalesce(jsonb_object_agg(m.id, kk_watch(m.id)), '{}'::jsonb) from kk_members m where m.group_id = g.id),
