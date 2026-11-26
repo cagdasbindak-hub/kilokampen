@@ -424,6 +424,7 @@ begin
   if not found then
     insert into kk_checks (member_id, challenge_id, date) values (me.id, p_challenge, p_date);
     perform kk_full_week(me.id, p_challenge, p_date);
+    perform kk_race_pass(me.id, p_challenge, p_date);
   end if;
   return kk_state(p_token);
 end $$;
@@ -1659,6 +1660,95 @@ exception when others then
   null;
 end $$;
 revoke all on function kk_full_week(uuid, text, date) from public, anon, authenticated;
+
+-- The race on each challenge (owner 2026-11-26: "varje kort kan du göra till en tävling … vem leder, vem är andra
+-- platsen"): days ticked, all weeks together, a tie shares the place (challengeRace in src/logic.ts, the same count).
+-- When a tick for today or yesterday takes someone past the one(s) in first place who had at least 3 days (RACE_PASS_AT
+-- in logic.ts), they are told: at most once per person and day (kk_fast_sent kind 'chpass') and once per person and
+-- challenge in five days ('chpass:&lt;id&gt;'), so two who take turns at the top are not woken by it every morning (Gemini's
+-- second opinion 2026-11-26). Never after the end date. Never blocks the tick.
+-- The challenges' names in sv/en/tr, the same as `challenge` in src/i18n.ts (scripts/test-coach.mjs compares them).
+create or replace function kk_challenge_names() returns jsonb
+language sql immutable as $$ select '{"steps":["8 000 steg", "8,000 steps", "8.000 adım"],
+  "soda":["Ingen läsk", "No soda", "Gazlı içecek yok"],
+  "stairs":["Ta trapporna", "Take the stairs", "Merdiven kullan"],
+  "water":["1,5 liter vatten", "1.5 litres of water", "1,5 litre su"],
+  "greens":["Grönt till lunch", "Greens at lunch", "Öğlen yeşillik"],
+  "evening":["Inget efter 20", "Nothing after 8", "Saat 20’den sonra yok"],
+  "walk":["30 minuters promenad", "30-minute walk", "30 dakika yürüyüş"],
+  "sweets":["Godisfri dag", "Sweet-free day", "Tatlısız gün"],
+  "sleep":["Sju timmars sömn", "Seven hours of sleep", "Yedi saat uyku"],
+  "protein":["Protein till frukost", "Protein at breakfast", "Kahvaltıda protein"],
+  "fruit":["Frukt till fikat", "Fruit at the coffee break", "Ara öğünde meyve"],
+  "fastfood":["Ingen snabbmat", "No fast food", "Fast food yok"],
+  "cook":["Lagad middag", "Home-cooked dinner", "Ev yemeği"],
+  "workout":["20 minuters träning", "20-minute workout", "20 dakika antrenman"],
+  "alcohol":["Alkoholfri dag", "Alcohol-free day", "Alkolsüz gün"],
+  "slow":["Ät långsamt", "Eat slowly", "Yavaş ye"],
+  "lunchbox":["Matlåda", "Lunch box", "Yemek kutusu"],
+  "stretch":["10 minuter rörlighet", "10 minutes of mobility", "10 dakika esneme"],
+  "commute":["Aktiv väg till jobbet", "Active way to work", "İşe aktif yol"],
+  "portion":["En portion", "One portion", "Tek porsiyon"],
+  "veggies5":["Fem om dagen", "Five a day", "Günde beş"],
+  "coffee":["Kaffe utan socker", "No sugar in coffee", "Şekersiz kahve"],
+  "standup":["Res dig varje timme", "Stand up every hour", "Her saat kalk"],
+  "pushups":["20 armhävningar", "20 push-ups", "20 şınav"],
+  "squats":["30 knäböj", "30 squats", "30 çömelme"],
+  "plank":["En minut planka", "One-minute plank", "Bir dakika plank"],
+  "daylight":["Ut i dagsljus", "Out in daylight", "Gün ışığına çık"],
+  "screens":["Skärmfri kvart", "Screen-free quarter", "Ekransız çeyrek"],
+  "plan":["Planera maten", "Plan your food", "Yemeğini planla"],
+  "snack":["Smart mellanmål", "Smart snack", "Akıllı ara öğün"],
+  "chips":["Inga chips", "No crisps", "Cips yok"],
+  "wholegrain":["Fullkorn", "Whole grain", "Tam tahıl"],
+  "fish":["Fisk på menyn", "Fish on the menu", "Menüde balık"],
+  "beans":["Bönor och linser", "Beans and lentils", "Fasulye ve mercimek"],
+  "dinnerwalk":["Promenad efter maten", "Walk after dinner", "Yemekten sonra yürü"],
+  "glass":["Vatten före maten", "Water before meals", "Yemekten önce su"],
+  "crunch":["Knapra grönt", "Crunch on veg", "Çiğ sebze kemir"],
+  "together":["Rör dig ihop", "Move together", "Birlikte hareket"],
+  "cheer":["Peppa en kollega", "Cheer a colleague", "Bir arkadaşını destekle"],
+  "wait":["Vänta tio minuter", "Wait ten minutes", "On dakika bekle"],
+  "steps10":["10 000 steg", "10,000 steps", "10.000 adım"],
+  "park":["Sista biten till fots", "Last bit on foot", "Son kısmı yürü"],
+  "walkcall":["Gående samtal", "Walking call", "Yürüyerek görüşme"],
+  "list":["Handla med lista", "Shop with a list", "Listeyle alışveriş"],
+  "veggieday":["Köttfri dag", "Meat-free day", "Etsiz gün"],
+  "balance":["Stå på ett ben", "Stand on one leg", "Tek ayak üstünde"],
+  "lunch":["Riktig lunch", "A proper lunch", "Düzgün öğle yemeği"],
+  "oats":["Gröt till frukost", "Porridge for breakfast", "Kahvaltıda yulaf"]}'::jsonb $$;
+revoke all on function kk_challenge_names() from public, anon, authenticated;
+
+create or replace function kk_race_pass(p_member uuid, p_challenge text, p_date date) returns void
+language plpgsql security definer set search_path = public as $$
+declare m kk_members; g kk_groups; n int; top int; r record; c uuid; nm jsonb := kk_challenge_names() -&gt; p_challenge;
+begin
+  if p_date &lt; current_date - 1 then return; end if;
+  select * into m from kk_members where id = p_member;
+  select * into g from kk_groups where id = m.group_id;
+  if nm is null or (g.end_date is not null and g.end_date &lt; current_date) then return; end if;
+  select count(distinct date) into n from kk_checks where member_id = p_member and challenge_id = p_challenge;
+  select max(x.cnt) into top from (select count(distinct k.date) as cnt from kk_checks k join kk_members o on o.id = k.member_id
+    where o.group_id = m.group_id and o.id &lt;&gt; p_member and k.challenge_id = p_challenge group by k.member_id) x;
+  if top is null or top &lt; 3 or n &lt;&gt; top + 1 then return; end if;
+  for r in select k.member_id as id from kk_checks k join kk_members o on o.id = k.member_id
+      where o.group_id = m.group_id and o.id &lt;&gt; p_member and k.challenge_id = p_challenge
+      group by k.member_id having count(distinct k.date) = top loop
+    if exists (select 1 from kk_fast_sent where member_id = r.id and kind = 'chpass:' || p_challenge and day &gt; current_date - 5) then continue; end if;
+    c := null;
+    insert into kk_fast_sent (member_id, day, kind) values (r.id, current_date, 'chpass') on conflict do nothing returning code into c;
+    if c is null then continue; end if;
+    insert into kk_fast_sent (member_id, day, kind) values (r.id, current_date, 'chpass:' || p_challenge) on conflict do nothing;
+    perform kk_push_i18n(array[r.id], kk_msg(
+      '⚔️ ' || m.name || ' gick om dig', m.name || ' leder nu ”' || (nm-&gt;&gt;0) || '” med ' || n || ' dagar. Du har ' || top || '. Ta tillbaka den.',
+      '⚔️ ' || m.name || ' passed you', m.name || ' now leads “' || (nm-&gt;&gt;1) || '” with ' || n || ' days. You have ' || top || '. Take it back.',
+      '⚔️ ' || m.name || ' seni geçti', '“' || (nm-&gt;&gt;2) || '” görevinde artık önde: ' || m.name || ', ' || n || ' gün. Sende ' || top || '. Geri al.'),
+      'utmaningar', 'chpass-' || r.id);
+  end loop;
+exception when others then
+  null;
+end $$;
+revoke all on function kk_race_pass(uuid, text, date) from public, anon, authenticated;
 
 -- ---------- who may call what ----------
 revoke all on function kk_hash(text, text), kk_new_code(), kk_me(uuid), kk_start_locked(kk_members, date), kk_check_person(text, text, numeric, numeric), kk_challenges(), kk_workout_kinds(),
