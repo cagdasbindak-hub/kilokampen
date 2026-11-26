@@ -148,6 +148,12 @@ alter table kk_members add column if not exists lang text not null default 'sv';
 alter table kk_fast_days enable row level security;
 alter table kk_fast_sent enable row level security;
 revoke all on kk_fast_days, kk_fast_sent from anon, authenticated;
+-- The person's own time (2026-11-27): the coach moves fast_goal after the morning answers, never later than this. For those
+-- who started before: the latest time they had since starting (the old coach moved times earlier until 24 Nov).
+alter table kk_members add column if not exists fast_base int;
+update kk_members m set fast_base = greatest(m.fast_goal, coalesce((select max(d.goal) from kk_fast_days d
+    where d.member_id = m.id and d.day &gt;= coalesce(m.fast_since, d.day)), m.fast_goal))
+  where m.fast_base is null and m.fast_on;
 
 alter table kk_groups enable row level security;
 alter table kk_members enable row level security;
@@ -274,7 +280,7 @@ begin
     'members', (select coalesce(json_agg(json_build_object(
         'id', m.id, 'name', m.name, 'emoji', m.emoji, 'color', m.color,
         'startKg', m.start_kg::float8, 'goalKg', m.goal_kg::float8, 'joined', m.joined, 'stepGoal', m.step_goal,
-        'fastOn', m.fast_on, 'fastGoal', m.fast_goal, 'fastSince', m.fast_since, 'lang', m.lang, 'version', m.app_version, 'seen', m.app_seen, 'app', m.app_installed,
+        'fastOn', m.fast_on, 'fastGoal', m.fast_goal, 'fastBase', greatest(coalesce(m.fast_base, m.fast_goal), m.fast_goal), 'fastSince', m.fast_since, 'lang', m.lang, 'version', m.app_version, 'seen', m.app_seen, 'app', m.app_installed,
         'appSince', m.app_since, 'push', exists (select 1 from kk_push_subs s where s.member_id = m.id),
         'fastYes', (select count(*) from kk_fast_days d where d.member_id = m.id and d.result = 'yes')) order by m.created_at), '[]'::json)
       from kk_members m where m.group_id = g.id),
@@ -1097,24 +1103,62 @@ begin
   if p_on is null or p_tone is null or p_tone not in ('hard', 'soft') then raise exception 'bad_text'; end if;
   if p_goal is null or p_goal &lt; 240 or p_goal &gt; 1679 then raise exception 'bad_date'; end if;
   restart := p_on and not me.fast_on;
+  -- A new time before last evening is answered: last evening keeps the time it had (setFast in src/logic.ts).
+  if p_on and me.fast_on and p_goal &lt;&gt; me.fast_goal and me.fast_since is not null and me.fast_since &lt;= kk_day() - 1 then
+    insert into kk_fast_days (member_id, day, goal) values (me.id, kk_day() - 1, me.fast_goal) on conflict do nothing;
+  end if;
+  -- The time picked by hand is the person's own time: the coach moves from it, never later than it.
   update kk_members set fast_on = p_on, fast_tone = p_tone,
     fast_goal = case when p_on then p_goal else fast_goal end,
+    fast_base = case when p_on then p_goal else fast_base end,
     fast_since = case when restart then kk_day() else fast_since end
   where id = me.id;
   return kk_state(p_token);
 end $$;
 
--- The morning answer about last evening, once. The time stays the person's own either way.
+-- The coach moves the time (owner 2026-11-27, steps after Gemini's second opinion; same rule as fastNext in src/logic.ts):
+-- two yes in a row on tonight's time → 10 minutes earlier, from 18:00 on 5, never before 17:00; a no → back 10 (from 18:00
+-- on) or 5 at once, the second no in a row 15/10, from the third 20, never later than the person's own time.
+create or replace function kk_fast_next(p_goal int, p_base int, p_result text, p_run int) returns int
+language sql immutable as $$
+  select case
+    when p_result = 'yes' then case
+      when p_run &lt; 2 or p_goal &lt;= 1020 then p_goal
+      when p_goal &gt; 1080 then greatest(1080, p_goal - 10)
+      else greatest(1020, p_goal - 5) end
+    when p_goal &gt;= p_base then p_goal
+    else least(p_base, p_goal + (case when p_goal &gt;= 1080 then array[10, 15, 20] else array[5, 10, 20] end)[least(greatest(p_run, 1), 3)])
+  end $$;
+
+-- The morning answer about last evening, once; then the coach moves tonight's time (kk_fast_next). The row is locked, so
+-- an answer from the notification and one from the app at the same moment cannot move the time twice.
 create or replace function kk_fast_answer_at(p_member uuid, p_result text, p_now timestamptz) returns void
 language plpgsql security definer set search_path = public as $$
-declare me kk_members; d date := kk_day(p_now) - 1;
+declare me kk_members; d date := kk_day(p_now) - 1; ev int; run int := 1; x date; r kk_fast_days;
 begin
-  select * into me from kk_members where id = p_member;
+  select * into me from kk_members where id = p_member for update;
   if p_result is null or p_result not in ('yes', 'no') then raise exception 'bad_text'; end if;
   if not me.fast_on or me.fast_since is null or me.fast_since &gt; d then raise exception 'bad_date'; end if;
   if exists (select 1 from kk_fast_days where member_id = me.id and day = d and result is not null) then raise exception 'bad_date'; end if;
+  select goal into ev from kk_fast_days where member_id = me.id and day = d;
+  ev := coalesce(ev, me.fast_goal);
   insert into kk_fast_days (member_id, day, goal, result, answered_at) values (me.id, d, me.fast_goal, p_result, p_now)
   on conflict (member_id, day) do update set result = excluded.result, answered_at = excluded.answered_at;
+  -- The same answers in a row ending last evening (calendar days from the first evening; a yes only on tonight's time).
+  -- A time changed by hand since that evening is left alone.
+  if ev = me.fast_goal then
+    x := d - 1;
+    loop
+      exit when x &lt; me.fast_since;
+      r := null;
+      select * into r from kk_fast_days where member_id = me.id and day = x;
+      exit when r.member_id is null or r.result is distinct from p_result or (p_result = 'yes' and r.goal &lt;&gt; me.fast_goal);
+      run := run + 1;
+      x := x - 1;
+    end loop;
+    update kk_members set fast_goal = kk_fast_next(me.fast_goal, greatest(coalesce(me.fast_base, me.fast_goal), me.fast_goal), p_result, run)
+    where id = me.id;
+  end if;
 end $$;
 create or replace function kk_fast_answer(p_token uuid, p_result text) returns json
 language plpgsql security definer set search_path = public as $$
@@ -1244,10 +1288,11 @@ end $$;
 -- question counts, once. Returns the coach's reply in the person's language and tone, shown as a new notification.
 create or replace function kk_fast_answer_code(p_code uuid, p_result text, p_now timestamptz default now()) returns json
 language plpgsql security definer set search_path = public as $$
-declare me kk_members; sent kk_fast_sent; g text; hard boolean; already boolean := false; title text; body text;
+declare me kk_members; sent kk_fast_sent; g text; hard boolean; already boolean := false; title text; body text; old int; up int;
 begin
   select * into sent from kk_fast_sent where code = p_code and kind in ('ask', 'nag') and day = kk_day(p_now);
   if sent.member_id is null then return json_build_object('error', 'bad_code'); end if;
+  select fast_goal into old from kk_members where id = sent.member_id;
   begin
     perform kk_fast_answer_at(sent.member_id, p_result, p_now);
   exception when others then
@@ -1255,21 +1300,35 @@ begin
   end;
   select * into me from kk_members where id = sent.member_id;
   g := kk_hhmm(me.fast_goal);
+  up := me.fast_goal - old;
   hard := me.fast_tone &lt;&gt; 'soft';
   title := case me.lang when 'en' then 'The coach' when 'tr' then 'Koç' else 'Coachen' end;
+  -- The same replies as the app (coach.hard yesMove/yesFloor/yesHold/noMove/no in src/i18n.ts), with tonight's time.
   body := case
     when already then case me.lang
       when 'en' then case when hard then 'You already answered. Focus on tonight: ' || g || '.' else 'You already answered. Tonight: ' || g || '.' end
       when 'tr' then case when hard then 'Zaten cevap verdin. Bu akşama odaklan: ' || g || '.' else 'Zaten cevap verdin. Bu akşam: ' || g || '.' end
       else case when hard then 'Du har redan svarat. Fokusera på i kväll: ' || g || '.' else 'Du har redan svarat. I kväll: ' || g || '.' end end
+    when p_result = 'no' and up &gt; 0 then case me.lang
+      when 'en' then case when hard then 'Weak, but honest. I give you ' || up || ' minutes: ' || g || ' tonight. Do it right.' else 'It happens. A little later tonight: ' || g || '.' end
+      when 'tr' then case when hard then 'Zayıf ama dürüst. Sana ' || up || ' dakika veriyorum: bu akşam ' || g || '. Doğru yap.' else 'Olur böyle şeyler. Bu akşam biraz daha geç: ' || g || '.' end
+      else case when hard then 'Svagt, men ärligt. Jag ger dig ' || up || ' minuter: ' || g || ' i kväll. Gör rätt.' else 'Det händer. Lite senare i kväll: ' || g || '.' end end
     when p_result = 'no' then case me.lang
       when 'en' then case when hard then 'Weak, but honest. Same time tonight: ' || g || '. Do it again, do it right.' else 'It happens. Same time tonight: ' || g || '. You can do it.' end
       when 'tr' then case when hard then 'Zayıf ama dürüst. Bu akşam aynı saat: ' || g || '. Tekrar yap, doğru yap.' else 'Olur böyle şeyler. Bu akşam aynı saat: ' || g || '. Başarabilirsin.' end
       else case when hard then 'Svagt, men ärligt. Samma tid i kväll: ' || g || '. Gör om, gör rätt.' else 'Det händer. Samma tid i kväll: ' || g || '. Du klarar det.' end end
+    when up &lt; 0 then case me.lang
+      when 'en' then case when hard then 'Good. Two in a row, so I move you: ' || g || ' tonight. No rest.' else 'Well done! New time tonight: ' || g || '.' end
+      when 'tr' then case when hard then 'Güzel. İki gün üst üste, saatini öne alıyorum: bu akşam ' || g || '. Dinlenmek yok.' else 'Harika iş! Bu akşam yeni saat: ' || g || '.' end
+      else case when hard then 'Bra. Två i rad, så jag flyttar dig: ' || g || ' i kväll. Ingen vila.' else 'Snyggt jobbat! Ny tid i kväll: ' || g || '.' end end
+    when me.fast_goal &lt;= 1020 then case me.lang
+      when 'en' then case when hard then 'Good. 17:00 is my floor: you need time for dinner. Hold ' || g || ' tonight.' else 'Well done! Tonight: ' || g || '.' end
+      when 'tr' then case when hard then 'Güzel. 17:00 benim alt sınırım: akşam yemeğine vaktin olmalı. Bu akşam ' || g || ' saatini koru.' else 'Harika iş! Bu akşam: ' || g || '.' end
+      else case when hard then 'Bra. 17:00 är mitt golv: du ska hinna äta middag. Håll ' || g || ' i kväll.' else 'Snyggt jobbat! I kväll: ' || g || '.' end end
     else case me.lang
-      when 'en' then case when hard then 'Good. Same time tonight: ' || g || '. No rest.' else 'Well done! Tonight: ' || g || '.' end
-      when 'tr' then case when hard then 'Güzel. Bu akşam aynı saat: ' || g || '. Dinlenmek yok.' else 'Harika iş! Bu akşam: ' || g || '.' end
-      else case when hard then 'Bra. Samma tid i kväll: ' || g || '. Ingen vila.' else 'Snyggt jobbat! I kväll: ' || g || '.' end end
+      when 'en' then case when hard then 'Good. One more evening at ' || g || ', then I move you.' else 'Well done! Tonight: ' || g || '.' end
+      when 'tr' then case when hard then 'Güzel. ' || g || ' ile bir akşam daha, sonra saatini öne alıyorum.' else 'Harika iş! Bu akşam: ' || g || '.' end
+      else case when hard then 'Bra. En kväll till på ' || g || ', sen flyttar jag dig.' else 'Snyggt jobbat! I kväll: ' || g || '.' end end
   end;
   return json_build_object('title', title, 'body', body);
 end $$;
@@ -1588,7 +1647,7 @@ begin
 end $$;
 revoke all on function kk_help(uuid, timestamptz), kk_help_msg(jsonb), kk_help_tick(timestamptz) from public, anon, authenticated;
 
-revoke all on function kk_day(timestamptz), kk_stop_at(date, int), kk_hhmm(int), kk_fast_answer_at(uuid, text, timestamptz),
+revoke all on function kk_day(timestamptz), kk_stop_at(date, int), kk_hhmm(int), kk_fast_answer_at(uuid, text, timestamptz), kk_fast_next(int, int, text, int),
   kk_fast_ate_at(uuid, timestamptz), kk_fast_tick(timestamptz), kk_fast_answer_code(uuid, text, timestamptz) from public, anon, authenticated;
 grant execute on function kk_fast_answer_code(uuid, text, timestamptz) to service_role;
 grant execute on function kk_fast_set(uuid, boolean, integer, text), kk_fast_answer(uuid, text), kk_fast_ate(uuid), kk_set_lang(uuid, text)
