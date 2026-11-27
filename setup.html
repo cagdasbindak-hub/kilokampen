@@ -482,9 +482,9 @@ begin
       get diagnostics n = row_count;
       if n = 1 then
         perform kk_push_i18n(kk_others(me.id), kk_msg(
-          me.name || ' har tränat 💪', 'Ett pass avklarat. Vad har du gjort?',
-          me.name || ' has trained 💪', 'One session done. What have you done?',
-          me.name || ' antrenman yaptı 💪', 'Bir antrenman tamam. Sen ne yaptın?'), 'utmaningar', 'workout-' || me.id);
+          me.name || ' har tränat 💪', 'Ett pass avklarat. Och du? Sitter du still, eller?',
+          me.name || ' has trained 💪', 'One session done. And you? Sitting still, or what?',
+          me.name || ' antrenman yaptı 💪', 'Bir antrenman tamam. Ya sen? Oturuyor musun yoksa?'), 'utmaningar', 'workout-' || me.id);
       end if;
     end if;
   end if;
@@ -503,9 +503,9 @@ begin
   -- The first time the day's goal is reached, the group is told.
   if p_steps &gt;= me.step_goal and coalesce(before, 0) &lt; me.step_goal and p_date &gt;= current_date - 1 then
     perform kk_push_i18n(kk_others(me.id), kk_msg(
-      me.name || ' nådde sitt stegmål 👟', kk_int(p_steps, 'sv') || ' steg i dag. Heja!',
-      me.name || ' reached their step goal 👟', kk_int(p_steps, 'en') || ' steps today. Go!',
-      me.name || ' adım hedefine ulaştı 👟', 'Bugün ' || kk_int(p_steps, 'tr') || ' adım. Helal olsun!'), 'utmaningar', 'steps-' || me.id);
+      me.name || ' nådde sitt stegmål 👟', kk_int(p_steps, 'sv') || ' steg i dag. Och du?',
+      me.name || ' reached their step goal 👟', kk_int(p_steps, 'en') || ' steps today. And you?',
+      me.name || ' adım hedefine ulaştı 👟', 'Bugün ' || kk_int(p_steps, 'tr') || ' adım. Ya sen?'), 'utmaningar', 'steps-' || me.id);
   end if;
   if p_steps = 0 then
     delete from kk_steps where member_id = me.id and date = p_date;
@@ -912,12 +912,12 @@ declare sender text;
 begin
   select name into sender from kk_members where id = new.from_id;
   if new.kind = 'poke' then
-    perform kk_push_i18n(array[new.to_id], kk_msg(sender || ' väntar på din vikt ⏰', 'Alla andra kan ställa sig på vågen. Det kan du också. Nu.',
-      sender || ' is waiting for your weight ⏰', 'Everyone else can step on the scale. So can you. Now.',
-      sender || ' kilonu bekliyor ⏰', 'Herkes tartıya çıkabiliyor. Sen de çıkabilirsin. Şimdi.'), 'hem', 'poke');
+    perform kk_push_i18n(array[new.to_id], kk_msg(sender || ' väntar på din vikt ⏰', 'Alla andra kan ställa sig på vågen. Kan inte du, eller? Nu.',
+      sender || ' is waiting for your weight ⏰', 'Everyone else can step on the scale. Can’t you, or what? Now.',
+      sender || ' kilonu bekliyor ⏰', 'Herkes tartıya çıkabiliyor. Sen çıkamıyor musun yoksa? Şimdi.'), 'hem', 'poke');
   else
-    perform kk_push_i18n(array[new.to_id], kk_msg(sender || ' hejar på dig 📣', 'Någon tror på dig. Nu levererar du.',
-      sender || ' is cheering for you 📣', 'Someone believes in you. Now deliver.', sender || ' seni alkışlıyor 📣', 'Biri sana inanıyor. Şimdi sıra sende.'), 'hem', 'cheer');
+    perform kk_push_i18n(array[new.to_id], kk_msg(sender || ' hejar på dig 📣', 'Någon tror på dig. Nu levererar du. Inget snack.',
+      sender || ' is cheering for you 📣', 'Someone believes in you. Now deliver. No talk.', sender || ' seni alkışlıyor 📣', 'Biri sana inanıyor. Şimdi sıra sende. Laf değil, iş.'), 'hem', 'cheer');
   end if;
   return new;
 exception when others then
@@ -960,8 +960,8 @@ end $$;
 create or replace function kk_on_member() returns trigger
 language plpgsql security definer set search_path = public as $$
 begin
-  perform kk_push_i18n(kk_others(new.id), kk_msg(new.name || ' har gått med 👋', 'En konkurrent till. Heja på, och visa vem som leder.',
-    new.name || ' has joined 👋', 'One more rival. Cheer, and show who leads.', new.name || ' gruba katıldı 👋', 'Bir rakip daha. Alkışla ve kimin önde olduğunu göster.'), 'topplista', 'join-' || new.id);
+  perform kk_push_i18n(kk_others(new.id), kk_msg(new.name || ' har gått med 👋', 'En konkurrent till. Visa vem som leder. Eller är du rädd?',
+    new.name || ' has joined 👋', 'One more rival. Show who leads. Or are you scared?', new.name || ' gruba katıldı 👋', 'Bir rakip daha. Kimin önde olduğunu göster. Yoksa korkuyor musun?'), 'topplista', 'join-' || new.id);
   return new;
 exception when others then
   return new;
@@ -1072,9 +1072,9 @@ declare who uuid[]; monday date := date_trunc('week', (now() at time zone 'Europ
 begin
   select array_agg(m.id) into who from kk_members m
   where not exists (select 1 from kk_weigh_ins w where w.member_id = m.id and w.date &gt;= monday);
-  perform kk_push_i18n(who, kk_msg('Ingen vikt den här veckan', 'Söndag och ingen vikt. Ursäkter har aldrig vunnit en vecka. Upp på vågen nu, tio sekunder.',
-    'No weight this week', 'Sunday and no weight. Excuses never won a week. Get on the scale now, ten seconds.',
-    'Bu hafta kilo yok', 'Pazar ve kilo yok. Bahaneler hafta kazandırmaz. Şimdi tartıya çık, on saniye.'), 'hem', 'weigh');
+  perform kk_push_i18n(who, kk_msg('Ingen vikt den här veckan', 'Söndag och ingen vikt. Kan du inte, eller? Ursäkter har aldrig vunnit en vecka. Upp på vågen nu, tio sekunder.',
+    'No weight this week', 'Sunday and no weight. Can’t you, or what? Excuses never won a week. Get on the scale now, ten seconds.',
+    'Bu hafta kilo yok', 'Pazar ve kilo yok. Yapamıyor musun yoksa? Bahaneler hafta kazandırmaz. Şimdi tartıya çık, on saniye.'), 'hem', 'weigh');
 end $$;
 
 -- ---------- the coach: Kvällsstopp (owner 2026-11-11) ----------
@@ -1241,18 +1241,18 @@ begin
       insert into kk_fast_sent (member_id, day, kind) values (m.id, l, 'nag') on conflict do nothing returning code into c;
       if c is not null then
         perform kk_push_i18n(array[m.id], case when hard then kk_msg(
-            'Du har inte svarat', (array[
+            'Vågar du inte svara?', (array[
               'Tystnad är också ett svar, och det är fel svar. Klarade du ' || g || ' i går?',
-              'Vinnare rapporterar. De andra gömmer sig. Vilken är du? Svara nu.',
-              'Coachen väntar fortfarande. Ett tryck: ja eller nej. Nu.'])[i],
-            'You have not answered', (array[
+              'Vinnare rapporterar. De andra gömmer sig. Ska du gömma dig hela dagen? Svara nu.',
+              'Coachen väntar fortfarande. Ett tryck: ja eller nej. Kan du inte ens det?'])[i],
+            'Afraid to answer?', (array[
               'Silence is an answer too, and it is the wrong one. Did you keep ' || g || ' yesterday?',
-              'Winners report. The others hide. Which one are you? Answer now.',
-              'The coach is still waiting. One tap: yes or no. Now.'])[i],
-            'Cevap vermedin', (array[
+              'Winners report. The others hide. Going to hide all day? Answer now.',
+              'The coach is still waiting. One tap: yes or no. Can’t you even do that?'])[i],
+            'Cevap vermeye korkuyor musun?', (array[
               'Sessizlik de bir cevaptır, hem de yanlış olanı. Dün saat ' || g || ' sınırını tuttun mu?',
-              'Kazananlar rapor verir. Diğerleri saklanır. Sen hangisisin? Hemen cevap ver.',
-              'Koç hâlâ bekliyor. Tek dokunuş: evet ya da hayır. Şimdi.'])[i])
+              'Kazananlar rapor verir. Diğerleri saklanır. Bütün gün saklanacak mısın? Hemen cevap ver.',
+              'Koç hâlâ bekliyor. Tek dokunuş: evet ya da hayır. Bunu bile mi yapamıyorsun?'])[i])
           else kk_msg('Glömde du?', 'Svara gärna om gårdagens kvällsstopp kl ' || g || '.',
             'Forgot?', 'Please answer about yesterday’s evening stop at ' || g || '.',
             'Unuttun mu?', 'Dün akşamki saat ' || g || ' sınırı için cevap ver lütfen.') end,
@@ -1266,15 +1266,15 @@ begin
             '30 minuter kvar', (array[
               'Kl ' || g || ' stänger köket. Sedan inget förrän du vaknar. Inte en bit.',
               'Om 30 minuter, kl ' || g || ', är det slut för i kväll. Ät klart nu eller låt bli.',
-              g || ' är gränsen. Efter det: vatten, te eller sömn. Inget annat.'])[i],
+              g || ' är gränsen. Efter det: vatten, te eller sömn. Klarar du det, eller?'])[i],
             '30 minutes left', (array[
               'At ' || g || ' the kitchen closes. Then nothing until you wake up. Not a bite.',
               'In 30 minutes, at ' || g || ', it is over for tonight. Finish eating now or leave it.',
-              g || ' is the limit. After that: water, tea or sleep. Nothing else.'])[i],
+              g || ' is the limit. After that: water, tea or sleep. Can you handle that?'])[i],
             '30 dakika kaldı', (array[
               'Saat ' || g || ' itibarıyla mutfak kapanıyor. Sonra uyanana kadar hiçbir şey yok. Bir lokma bile.',
               '30 dakika sonra, saat ' || g || ', bu akşam bitiyor. Ya şimdi bitir ya hiç.',
-              'Sınır saat ' || g || '. Sonrası: su, çay ya da uyku. Başka bir şey yok.'])[i])
+              'Sınır saat ' || g || '. Sonrası: su, çay ya da uyku. Bunu yapabilir misin?'])[i])
           else kk_msg('Snart kvällsstopp', 'Ditt kvällsstopp är kl ' || g || '. 30 minuter kvar.',
             'Evening stop soon', 'Your evening stop is at ' || g || '. 30 minutes left.',
             'Akşam sınırı yaklaşıyor', 'Akşam sınırın saat ' || g || '. 30 dakika kaldı.') end,
@@ -1311,11 +1311,11 @@ begin
       else case when hard then 'Du har redan svarat. Fokusera på i kväll: ' || g || '.' else 'Du har redan svarat. I kväll: ' || g || '.' end end
     when p_result = 'no' and up &gt; 0 then case me.lang
       when 'en' then case when hard then 'Weak, but honest. I give you ' || up || ' minutes: ' || g || ' tonight. Do it right.' else 'It happens. A little later tonight: ' || g || '.' end
-      when 'tr' then case when hard then 'Zayıf ama dürüst. Sana ' || up || ' dakika veriyorum: bu akşam ' || g || '. Doğru yap.' else 'Olur böyle şeyler. Bu akşam biraz daha geç: ' || g || '.' end
+      when 'tr' then case when hard then 'Olmadı ama dürüstsün. Sana ' || up || ' dakika veriyorum: bu akşam ' || g || '. Doğru yap.' else 'Olur böyle şeyler. Bu akşam biraz daha geç: ' || g || '.' end
       else case when hard then 'Svagt, men ärligt. Jag ger dig ' || up || ' minuter: ' || g || ' i kväll. Gör rätt.' else 'Det händer. Lite senare i kväll: ' || g || '.' end end
     when p_result = 'no' then case me.lang
       when 'en' then case when hard then 'Weak, but honest. Same time tonight: ' || g || '. Do it again, do it right.' else 'It happens. Same time tonight: ' || g || '. You can do it.' end
-      when 'tr' then case when hard then 'Zayıf ama dürüst. Bu akşam aynı saat: ' || g || '. Tekrar yap, doğru yap.' else 'Olur böyle şeyler. Bu akşam aynı saat: ' || g || '. Başarabilirsin.' end
+      when 'tr' then case when hard then 'Olmadı ama dürüstsün. Bu akşam aynı saat: ' || g || '. Tekrar yap, doğru yap.' else 'Olur böyle şeyler. Bu akşam aynı saat: ' || g || '. Başarabilirsin.' end
       else case when hard then 'Svagt, men ärligt. Samma tid i kväll: ' || g || '. Gör om, gör rätt.' else 'Det händer. Samma tid i kväll: ' || g || '. Du klarar det.' end end
     when up &lt; 0 then case me.lang
       when 'en' then case when hard then 'Good. Two in a row, so I move you: ' || g || ' tonight. No rest.' else 'Well done! New time tonight: ' || g || '.' end
@@ -1437,45 +1437,45 @@ begin
       'Where are you?', n || ' days without opening the app. I see it. Open it now and show you are still in.',
       'Neredesin?', n || ' gündür uygulamayı açmadın. Görüyorum. Şimdi aç ve hâlâ burada olduğunu göster.')
     when 'weigh' then kk_msg(
-      'Ingen vägning än', 'Veckan är snart slut och du har inte vägt dig. I morgon bitti, före frukost. Ingen ursäkt.',
-      'No weigh-in yet', 'The week is almost over and you have not weighed in. Tomorrow morning, before breakfast. No excuse.',
-      'Henüz tartılmadın', 'Hafta bitmek üzere ve hâlâ tartılmadın. Yarın sabah, kahvaltıdan önce. Bahane yok.')
+      'Ingen vägning än', 'Veckan är snart slut och du har inte vägt dig. Kan du inte, eller? I morgon bitti, före frukost.',
+      'No weigh-in yet', 'The week is almost over and you have not weighed in. Can’t you, or what? Tomorrow morning, before breakfast.',
+      'Henüz tartılmadın', 'Hafta bitmek üzere ve hâlâ tartılmadın. Yapamıyor musun yoksa? Yarın sabah, kahvaltıdan önce.')
     when 'eat' then kk_msg(
       'Du behöver äta mindre', 'Du åt efter stoppet ' || n || ' av de tre senaste kvällarna. Det är inget misstag, det är ett val. I kväll: inget efter ' || s || '.',
       'You need to eat less', 'You ate after the stop on ' || n || ' of the last three evenings. That is not a mistake, it is a choice. Tonight: nothing after ' || s || '.',
       'Daha az yemelisin', 'Son üç akşamın ' || n || ' tanesinde sınırdan sonra yedin. Bu bir hata değil, bir seçim. Bu akşam: saat ' || s || ' sonrası hiçbir şey yok.')
     when 'steps' then kk_msg(
-      'Du ligger efter', 'Vill du inte röra på dig? ' || kk_int(a, 'sv') || ' steg om dagen, målet är ' || kk_int(goal, 'sv') || '. Ut och gå 20 minuter i kväll.',
-      'You are falling behind', 'Don’t you want to move? ' || kk_int(a, 'en') || ' steps a day, the goal is ' || kk_int(goal, 'en') || '. Go for a 20-minute walk tonight.',
-      'Geride kalıyorsun', 'Hareket etmek istemiyor musun? Günde ' || kk_int(a, 'tr') || ' adım, hedef ' || kk_int(goal, 'tr') || '. Bu akşam 20 dakika yürü.')
+      'Du ligger efter', 'Orkar du inte, eller? ' || kk_int(a, 'sv') || ' steg om dagen, målet är ' || kk_int(goal, 'sv') || '. Ut och gå 20 minuter i kväll.',
+      'You are falling behind', 'Too tired, or what? ' || kk_int(a, 'en') || ' steps a day, the goal is ' || kk_int(goal, 'en') || '. Go for a 20-minute walk tonight.',
+      'Geride kalıyorsun', 'Gücün mü yetmiyor yoksa? Günde ' || kk_int(a, 'tr') || ' adım, hedef ' || kk_int(goal, 'tr') || '. Bu akşam 20 dakika yürü.')
     when 'nosteps' then kk_msg(
-      'Inga steg på tre dagar', 'Rör du dig inte, eller skriver du bara inte in dem? Båda är dåliga. Målet är ' || kk_int(goal, 'sv') || ' steg.',
-      'No steps for three days', 'Are you not moving, or just not writing them down? Both are bad. The goal is ' || kk_int(goal, 'en') || ' steps.',
-      'Üç gündür adım yok', 'Hareket mi etmiyorsun, yoksa sadece yazmıyor musun? İkisi de kötü. Hedef ' || kk_int(goal, 'tr') || ' adım.')
+      'Inga steg på tre dagar', 'Rör du dig inte, eller skriver du bara inte in dem? Båda är svagt. Målet är ' || kk_int(goal, 'sv') || ' steg.',
+      'No steps for three days', 'Are you not moving, or just not writing them down? Both are weak. The goal is ' || kk_int(goal, 'en') || ' steps.',
+      'Üç gündür adım yok', 'Hareket mi etmiyorsun, yoksa sadece yazmıyor musun? İkisi de bahane. Hedef ' || kk_int(goal, 'tr') || ' adım.')
     when 'move' then kk_msg(
-      'Rör på dig', 'Du skriver aldrig in dina steg. Börja i dag. Målet är ' || kk_int(goal, 'sv') || ' steg, och jag håller koll.',
-      'Move', 'You never write down your steps. Start today. The goal is ' || kk_int(goal, 'en') || ' steps, and I am watching.',
-      'Hareket et', 'Adımlarını hiç yazmıyorsun. Bugün başla. Hedef ' || kk_int(goal, 'tr') || ' adım ve takipteyim.')
+      'Rör på dig', 'Du skriver aldrig in dina steg. Kan du inte, eller? Börja i dag. Målet är ' || kk_int(goal, 'sv') || ' steg, och jag håller koll.',
+      'Move', 'You never write down your steps. Can’t you, or what? Start today. The goal is ' || kk_int(goal, 'en') || ' steps, and I am watching.',
+      'Hareket et', 'Adımlarını hiç yazmıyorsun. Yapamıyor musun yoksa? Bugün başla. Hedef ' || kk_int(goal, 'tr') || ' adım ve takipteyim.')
     when 'challenge' then kk_msg(
-      'Inga utmaningar', 'Tre dagar utan en enda avbockad utmaning. Välj en i dag och gör den. Nu.',
-      'No challenges', 'Three days without a single challenge ticked. Pick one today and do it. Now.',
-      'Görev yok', 'Üç gündür tek bir görev işaretlemedin. Bugün birini seç ve yap. Şimdi.')
+      'Är du svag, eller?', 'Tre dagar utan en enda avbockad utmaning. Välj en i dag och gör den. Nu.',
+      'Are you weak, or what?', 'Three days without a single challenge ticked. Pick one today and do it. Now.',
+      'Gücün mü yetmiyor?', 'Üç gündür tek bir görev işaretlemedin. Bugün birini seç ve yap. Şimdi.')
     when 'chno' then kk_msg(
-      'Nej, nej, nej', 'Du har sagt nej till ' || n || ' utmaningar på en vecka och bockat noll. Det finns fler att välja på. Välj en och gör den. I dag.',
-      'No, no, no', 'You said no to ' || n || ' challenges in a week and ticked none. There are more to choose from. Pick one and do it. Today.',
-      'Hayır, hayır, hayır', 'Bir haftada ' || n || ' göreve hayır dedin ve hiçbirini işaretlemedin. Seçecek daha çok şey var. Birini seç ve yap. Bugün.')
+      'Nej, nej, nej', 'Du har sagt nej till ' || n || ' utmaningar på en vecka och bockat noll. Är allt för svårt, eller? Välj en och gör den. I dag.',
+      'No, no, no', 'You said no to ' || n || ' challenges in a week and ticked none. Is everything too hard, or what? Pick one and do it. Today.',
+      'Hayır, hayır, hayır', 'Bir haftada ' || n || ' göreve hayır dedin ve hiçbirini işaretlemedin. Her şey mi zor geliyor? Birini seç ve yap. Bugün.')
     when 'habit' then kk_msg(
-      'Släpp den inte', 'Du har gjort en utmaning ' || n || ' gånger, och nu tre dagar utan. Det är så vanor dör. Gör den i dag.',
-      'Don’t let go', 'You have done a challenge ' || n || ' times, and now three days without. That is how habits die. Do it today.',
-      'Bırakma', 'Bir görevi ' || n || ' kez yaptın, şimdi üç gündür yok. Alışkanlıklar böyle ölür. Bugün yap.')
+      'Släpp den inte', 'Du har gjort en utmaning ' || n || ' gånger, och nu tre dagar utan. Ska du ge upp nu? Det är så vanor dör. Gör den i dag.',
+      'Don’t let go', 'You have done a challenge ' || n || ' times, and now three days without. Giving up now? That is how habits die. Do it today.',
+      'Bırakma', 'Bir görevi ' || n || ' kez yaptın, şimdi üç gündür yok. Şimdi mi pes edeceksin? Alışkanlıklar böyle ölür. Bugün yap.')
     when 'chfav' then kk_msg(
-      'Snack eller verkstad?', 'Intressant, sa du. Tre dagar utan en bock på dina favoriter. Ord är billiga. Gör en i dag.',
-      'Talk or action?', 'Interesting, you said. Three days without a tick on your favourites. Words are cheap. Do one today.',
-      'Laf mı, iş mi?', 'İlginç demiştin. Üç gündür favorilerinden hiçbirini işaretlemedin. Laf ucuz. Bugün birini yap.')
+      'Snack eller verkstad?', 'Intressant, sa du. Tre dagar utan en bock på dina favoriter. Snacka kan alla. Gör en i dag.',
+      'Talk or action?', 'Interesting, you said. Three days without a tick on your favourites. Talk is cheap. Do one today.',
+      'Laf mı, iş mi?', 'İlginç demiştin. Üç gündür favorilerinden hiçbirini işaretlemedin. Konuşmak kolay. Bugün birini yap.')
     else kk_msg(
-      'Du behöver fasta mer', 'Du har inget kvällsstopp. De andra stänger köket varje kväll. Starta i kväll, det tar tio sekunder.',
-      'You need to fast more', 'You have no evening stop. The others close the kitchen every evening. Start tonight, it takes ten seconds.',
-      'Akşam sınırın yok', 'Diğerleri her akşam mutfağı kapatıyor. Sen hâlâ başlamadın. Bu akşam başla, on saniye sürer.')
+      'Du behöver fasta mer', 'Du har inget kvällsstopp. De andra stänger köket varje kväll. Vågar du inte, eller? Starta i kväll, det tar tio sekunder.',
+      'You need to fast more', 'You have no evening stop. The others close the kitchen every evening. Scared, are you? Start tonight, it takes ten seconds.',
+      'Akşam sınırın yok', 'Diğerleri her akşam mutfağı kapatıyor. Sen hâlâ başlamadın. Korkuyor musun yoksa? Bu akşam başla, on saniye sürer.')
   end;
 end $$;
 
@@ -1712,9 +1712,9 @@ begin
   insert into kk_fast_sent (member_id, day, kind) values (p_member, w, 'full7') on conflict do nothing returning code into c;
   if c is null then return; end if;
   perform kk_push_i18n(kk_others(p_member), kk_msg(
-    '💯 ' || m.name || ': sju av sju!', m.name || ' klarade en utmaning varje dag hela veckan. Skicka en hejning.',
-    '💯 ' || m.name || ': seven out of seven!', m.name || ' did a challenge every day for a whole week. Send a cheer.',
-    '💯 ' || m.name || ': yediye yedi!', m.name || ' bir görevi bütün hafta her gün yaptı. Bir alkış gönder.'),
+    '💯 ' || m.name || ': sju av sju!', m.name || ' klarade en utmaning varje dag hela veckan. Och du?',
+    '💯 ' || m.name || ': seven out of seven!', m.name || ' did a challenge every day for a whole week. And you?',
+    '💯 ' || m.name || ': yediye yedi!', m.name || ' bir görevi bütün hafta her gün yaptı. Ya sen?'),
     'topplista', 'full7-' || p_member);
 exception when others then
   null;
@@ -1800,9 +1800,9 @@ begin
     if c is null then continue; end if;
     insert into kk_fast_sent (member_id, day, kind) values (r.id, current_date, 'chpass:' || p_challenge) on conflict do nothing;
     perform kk_push_i18n(array[r.id], kk_msg(
-      '⚔️ ' || m.name || ' gick om dig', m.name || ' leder nu ”' || (nm-&gt;&gt;0) || '” med ' || n || ' dagar. Du har ' || top || '. Ta tillbaka den.',
-      '⚔️ ' || m.name || ' passed you', m.name || ' now leads “' || (nm-&gt;&gt;1) || '” with ' || n || ' days. You have ' || top || '. Take it back.',
-      '⚔️ ' || m.name || ' seni geçti', '“' || (nm-&gt;&gt;2) || '” görevinde artık önde: ' || m.name || ', ' || n || ' gün. Sende ' || top || '. Geri al.'),
+      '⚔️ ' || m.name || ' gick om dig', m.name || ' leder nu ”' || (nm-&gt;&gt;0) || '” med ' || n || ' dagar. Du har ' || top || '. Ska du låta det vara så? Ta tillbaka den.',
+      '⚔️ ' || m.name || ' passed you', m.name || ' now leads “' || (nm-&gt;&gt;1) || '” with ' || n || ' days. You have ' || top || '. Going to let that stand? Take it back.',
+      '⚔️ ' || m.name || ' seni geçti', '“' || (nm-&gt;&gt;2) || '” görevinde artık önde: ' || m.name || ', ' || n || ' gün. Sende ' || top || '. Buna razı mısın? Geri al.'),
       'utmaningar', 'chpass-' || r.id);
   end loop;
 exception when others then
